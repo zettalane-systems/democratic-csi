@@ -21,6 +21,7 @@ const {
   EphemeralInlineVHDDriver,
 } = require("./ephemeral-inline-vhd");
 const { NodeManualDriver } = require("./node-manual");
+const { ControllerZettalaneDriver } = require("./controller-zettalane");
 
 function factory(ctx, options) {
   switch (options.driver) {
@@ -72,6 +73,10 @@ function factory(ctx, options) {
       return new EphemeralInlineVHDDriver(ctx, options);
     case "node-manual":
       return new NodeManualDriver(ctx, options);
+    case "mayanas":
+    case "mayascale":
+    case "mayanas-lustre":
+      return new ControllerZettalaneDriver(ctx, options);
     default:
       throw new Error("invalid csi driver: " + options.driver);
   }
