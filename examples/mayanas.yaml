@@ -1,0 +1,39 @@
+# ZettaLane MayaNAS — NFS (per-PVC shares provisioned via mayacli).
+#
+#   helm upgrade --install csi-mayanas \
+#     oci://<registry>/zettalane/zettalane-csi --version <X.Y.Z> \
+#     -n zettalane-system --create-namespace -f mayanas.yaml
+#
+# Fill in <pool>, the control-plane VIPs, and the image registry/tag.
+
+fullnameOverride: csi-mayanas              # workloads render csi-mayanas-{controller,node}
+
+csiDriver:
+  name: "csi-mayanas.zettalane.com"
+  attachRequired: false                    # NFS is mount-only (no ControllerPublish/attach)
+
+controller:
+  hostNetwork: true                        # configd sees the node IP (TCP-wrappers hosts.allow scope)
+  externalAttacher:    { enabled: false }
+  externalSnapshotter: { enabled: false }
+  externalResizer:     { enabled: true }   # ControllerExpandVolume -> zfs refquota
+  externalProvisioner: { enabled: true }
+
+storageClasses:
+  - name: mayanas-nfs
+    defaultClass: false
+    reclaimPolicy: Delete
+    volumeBindingMode: Immediate
+    allowVolumeExpansion: true
+    parameters:
+      fsType: nfs
+      protocol: nfs
+      pool: "<pool-name>"
+    mountOptions:
+      - nfsvers=4.2
+      - hard
+
+driver:
+  config:
+    driver: mayanas
+    mayanas: "<vip1>,<vip2>"               # control-plane VIP list (endpoints + discovery)

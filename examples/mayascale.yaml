@@ -1,0 +1,38 @@
+# ZettaLane MayaScale — block / NVMe-oF.
+#
+#   helm upgrade --install csi-mayascale \
+#     oci://<registry>/zettalane/zettalane-csi --version <X.Y.Z> \
+#     -n zettalane-system --create-namespace -f mayascale.yaml
+#
+# Fill in <pool>, the control-plane VIPs, and the image registry/tag.
+
+fullnameOverride: csi-mayascale            # workloads render csi-mayascale-{controller,node}
+
+csiDriver:
+  name: "csi-mayascale.zettalane.com"
+  attachRequired: false                    # node nvme-connects from volume_context; no ControllerPublish
+
+controller:
+  externalAttacher:    { enabled: false }
+  externalSnapshotter: { enabled: false }
+  externalResizer:     { enabled: true }   # ControllerExpandVolume
+  externalProvisioner: { enabled: true }
+
+node:
+  driver:
+    nvmeDirMountEnabled: true              # hostPath the NODE's /etc/nvme -> unique per-node hostnqn
+
+storageClasses:
+  - name: mayascale-block
+    defaultClass: false
+    reclaimPolicy: Delete
+    volumeBindingMode: Immediate
+    allowVolumeExpansion: true
+    parameters:
+      protocol: nvme-of
+      pool: "<vg-or-thinpool-name>"
+
+driver:
+  config:
+    driver: mayascale
+    mayascale: "<vip1>,<vip2>"             # control-plane VIP list (endpoints + discovery)

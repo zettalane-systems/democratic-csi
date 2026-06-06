@@ -1,181 +1,100 @@
-# docker build --pull -t foobar .
-# docker buildx build --pull -t foobar --platform linux/amd64,linux/arm64,linux/arm/v7,linux/s390x,linux/ppc64le .
-# docker run --rm -ti --user root --entrypoint /bin/bash foobar
-
-######################
-# golang builder
-######################
-# FROM golang:1.25.3-bookworm AS ctrbuilder
+# ZettaLane CSI image — Rocky Linux 9 (el9) base.
 #
-# # /go/containerd/ctr
-# ADD docker/ctr-mount-labels.diff /tmp
-# RUN \
-#   git clone https://github.com/containerd/containerd.git; \
-#   cd containerd && \
-#   git checkout v2.0.4 && \
-#   git apply /tmp/ctr-mount-labels.diff && \
-#   CGO_ENABLED=0 go build ./cmd/ctr/;
-
+# Preferred base: mayacli is BUILT on el9 (GLIBC_2.34, /lib64), and the MayaNAS
+# storage node is el9 — so a Rocky 9 image is a NATIVE ABI match (no debian
+# forward-compat assumption) and shares one lib/tooling stack with the server.
+# Swap `rockylinux:9-minimal` for `redhat/ubi9-minimal` if you want Red Hat UBI.
+#
+# Build context = the staged tree (staging/zettalane-csi). Example:
+#   docker build -f Dockerfile -t zettalane-csi:el9 staging/zettalane-csi
+# (build-staging.sh stages the selected base Dockerfile as ./Dockerfile)
 
 ######################
-# nodejs builder
+# nodejs build stage
 ######################
-FROM debian:12-slim AS build
-#FROM --platform=$BUILDPLATFORM debian:10-slim AS build
+FROM rockylinux:9-minimal AS build
 
-ENV DEBIAN_FRONTEND=noninteractive
-
-ARG TARGETPLATFORM
-ARG BUILDPLATFORM
-
-RUN echo "I am running build on $BUILDPLATFORM, building for $TARGETPLATFORM"
-
-RUN apt-get update && apt-get install -y locales && rm -rf /var/lib/apt/lists/* \
-  && localedef -i en_US -c -f UTF-8 -A /usr/share/locale/locale.alias en_US.UTF-8
-
-ENV LANG=en_US.utf8
 ENV NODE_VERSION=v20.19.0
 ENV NODE_ENV=production
+ENV LANG=C.UTF-8
 
-# install build deps
-# RUN apt-get update && apt-get install -y python3 make cmake gcc g++
+# tools needed by node-installer.sh (download + extract node from nodejs.org)
+RUN microdnf install -y wget tar xz gzip ca-certificates \
+  && microdnf clean all
 
-# install node
-RUN apt-get update && apt-get install -y wget xz-utils
 ADD docker/node-installer.sh /usr/local/sbin
 RUN chmod +x /usr/local/sbin/node-installer.sh && node-installer.sh
 ENV PATH=/usr/local/lib/nodejs/bin:$PATH
 
-# Workaround for https://github.com/nodejs/node/issues/37219
-RUN test $(uname -m) != armv7l || ( \
-  apt-get update \
-  && apt-get install -y libatomic1 \
-  && rm -rf /var/lib/apt/lists/* \
-  )
-
-# Run as a non-root user
-RUN useradd --create-home csi \
-  && mkdir /home/csi/app \
-  && chown -R csi: /home/csi
-WORKDIR /home/csi/app
-USER csi
-
-# prevent need to build re2 module
-# https://github.com/uhop/install-artifact-from-github/wiki/Making-local-mirror
-ENV RE2_DOWNLOAD_MIRROR="https://grpc-uds-binaries.s3-us-west-2.amazonaws.com/re2"
-ENV RE2_DOWNLOAD_SKIP_PATH=1
-
-COPY --chown=csi:csi package*.json ./
-RUN npm install --only=production --grpc_node_binary_host_mirror=https://grpc-uds-binaries.s3-us-west-2.amazonaws.com/debian-buster
-COPY --chown=csi:csi . .
-RUN rm -rf docker
+WORKDIR /app
+# install deps first for layer caching; no native modules -> no mirror env needed
+COPY package*.json ./
+RUN npm install --only=production --no-audit --no-fund
+COPY . .
+RUN rm -rf docker packaging vendor
 
 
 ######################
-# actual image
+# final image
 ######################
-FROM debian:12-slim
+FROM rockylinux:9-minimal
 
-LABEL org.opencontainers.image.source https://github.com/democratic-csi/democratic-csi
-LABEL org.opencontainers.image.url https://github.com/democratic-csi/democratic-csi
-LABEL org.opencontainers.image.licenses MIT
+ARG VERSION=dev
+# Artifact identity only. This image is an el9 Linux runtime carrying the CSI
+# payload + (proprietary) mayacli — its license is NOT a single license and NOT
+# MIT; the per-component picture lives in the bundled LICENSE/NOTICE, not a label.
+LABEL org.opencontainers.image.title="zettalane-csi" \
+      org.opencontainers.image.vendor="ZettaLane Systems LLC" \
+      org.opencontainers.image.version="${VERSION}"
 
-ENV DEBIAN_FRONTEND=noninteractive
 ENV DEMOCRATIC_CSI_IS_CONTAINER=true
-
-ARG TARGETPLATFORM
-ARG BUILDPLATFORM
-ARG OBJECTIVEFS_DOWNLOAD_ID
-
-RUN echo "I am running on final $BUILDPLATFORM, building for $TARGETPLATFORM"
-
-RUN apt-get update && apt-get install -y locales && rm -rf /var/lib/apt/lists/* \
-  && localedef -i en_US -c -f UTF-8 -A /usr/share/locale/locale.alias en_US.UTF-8
-
-ENV LANG=en_US.utf8
 ENV NODE_ENV=production
+ENV LANG=C.UTF-8
 
-# Workaround for https://github.com/nodejs/node/issues/37219
-RUN test $(uname -m) != armv7l || ( \
-  apt-get update \
-  && apt-get install -y libatomic1 \
-  && rm -rf /var/lib/apt/lists/* \
-  )
-
-# install ctr
-#COPY --from=ctrbuilder /go/containerd/ctr /usr/local/bin/ctr
-
-# install node
-#ENV PATH=/usr/local/lib/nodejs/bin:$PATH
-#COPY --from=build /usr/local/lib/nodejs /usr/local/lib/nodejs
+# node binary from the build stage
 COPY --from=build /usr/local/lib/nodejs/bin/node /usr/local/bin/node
 
-# node service requirements
-# netbase is required by rpcbind/rpcinfo to work properly
-# /etc/{services,rpc} are required
-RUN apt-get update && \
-  apt-get install -y wget netbase zip bzip2 socat e2fsprogs exfatprogs xfsprogs btrfs-progs fatresize dosfstools ntfs-3g nfs-common cifs-utils fdisk gdisk cloud-guest-utils sudo rsync procps util-linux nvme-cli fuse3 && \
-  rm -rf /var/lib/apt/lists/*
+# runtime + node-attach tooling (nfs + nvme-of + mkfs/mount) and mayacli's libs.
+# On el9 these are the EXACT lib versions mayacli was linked against:
+#   libuuid -> libuuid.so.1 | openssl-libs -> libssl.so.3 + libcrypto.so.3
+#   libtirpc -> libtirpc.so.3 | krb5-libs -> libgssapi_krb5/krb5/... (tirpc dep)
+# install_weak_deps=0 drops recommended-only bloat (fonts, cracklib-dicts, gnupg2,
+# langpack extras, etc.); tsflags=nodocs skips man/doc. Connectors kept: nfs, nvme-of,
+# iscsi, smb(cifs). Dropped: fuse3 (only the oneclient/objectivefs FUSE connectors,
+# which we never emit). After install, strip the dnf history + cache (microdnf clean
+# all leaves /var/lib/dnf/history.* + the WAL).
+#
+# iscsi-initiator-utils is installed in its OWN microdnf call. In ONE combined
+# transaction with the rest, its %post `systemctl` hits "Failed to connect to bus" and
+# fails the build; split into a separate call it runs `systemctl preset` offline cleanly
+# (exit 0). microdnf has no --noscripts / tsflags=noscripts, so the split IS the fix --
+# no scriptlet-skip or error-swallow needed.
+RUN microdnf install -y --setopt=install_weak_deps=0 --setopt=tsflags=nodocs \
+      glibc-minimal-langpack \
+      nfs-utils nvme-cli \
+      xfsprogs e2fsprogs util-linux gdisk cloud-utils-growpart \
+      cifs-utils socat rsync procps-ng \
+      libuuid openssl-libs libtirpc krb5-libs zlib \
+  && microdnf install -y --setopt=install_weak_deps=0 --setopt=tsflags=nodocs \
+      iscsi-initiator-utils \
+  && microdnf clean all \
+  && rm -rf /var/lib/dnf/history.* /var/cache/dnf /var/log/dnf* /var/log/hawkey.log
 
-RUN \
-  echo '83e7a026-2564-455b-ada6-ddbdaf0bc519' > /etc/nvme/hostid && \
-  echo 'nqn.2014-08.org.nvmexpress:uuid:941e4f03-2cd6-435e-86df-731b1c573d86' > /etc/nvme/hostnqn
+# nvme host identity — required for `nvme connect` on the node plugin
+RUN mkdir -p /etc/nvme \
+  && echo '83e7a026-2564-455b-ada6-ddbdaf0bc519' > /etc/nvme/hostid \
+  && echo 'nqn.2014-08.org.nvmexpress:uuid:941e4f03-2cd6-435e-86df-731b1c573d86' > /etc/nvme/hostnqn
 
-ARG RCLONE_VERSION=1.71.2
-ADD docker/rclone-installer.sh /usr/local/sbin
-RUN chmod +x /usr/local/sbin/rclone-installer.sh && rclone-installer.sh
+# bundle mayacli (controller calls it; talks RPC to remote configd).
+# build-staging.sh stages the binary at vendor/mayacli. On el9 this is a native
+# ABI match for the el9-built binary — no forward-compat reliance.
+COPY vendor/mayacli /usr/local/bin/mayacli
+RUN chmod +x /usr/local/bin/mayacli
 
-ARG RESTIC_VERSION=0.18.1
-ADD docker/restic-installer.sh /usr/local/sbin
-RUN chmod +x /usr/local/sbin/restic-installer.sh && restic-installer.sh
-
-ARG KOPIA_VERSION=0.21.1
-ADD docker/kopia-installer.sh /usr/local/sbin
-RUN chmod +x /usr/local/sbin/kopia-installer.sh && kopia-installer.sh
-
-ARG YQ_VERSION=v4.48.1
-ADD docker/yq-installer.sh /usr/local/sbin
-RUN chmod +x /usr/local/sbin/yq-installer.sh && yq-installer.sh
-
-ARG CTR_VERSION=v2.0.4
-ADD docker/ctr-installer.sh /usr/local/sbin
-RUN chmod +x /usr/local/sbin/ctr-installer.sh && ctr-installer.sh
-
-# controller requirements
-#RUN apt-get update && \
-#        apt-get install -y ansible && \
-#        rm -rf /var/lib/apt/lists/*
-
-# install objectivefs
-ARG OBJECTIVEFS_VERSION=7.3
-ADD docker/objectivefs-installer.sh /usr/local/sbin
-RUN chmod +x /usr/local/sbin/objectivefs-installer.sh && objectivefs-installer.sh
-
-# install wrappers
-ADD docker/iscsiadm /usr/local/sbin
-
-ADD docker/multipath /usr/local/sbin
-
-## USE_HOST_MOUNT_TOOLS=1
-ADD docker/mount /usr/local/bin/mount
-
-## USE_HOST_MOUNT_TOOLS=1
-ADD docker/umount /usr/local/bin/umount
-
-ADD docker/zfs /usr/local/bin/zfs
-ADD docker/zpool /usr/local/bin/zpool
-ADD docker/oneclient /usr/local/bin/oneclient
-
-RUN chown -R root:root /usr/local/bin/*
-RUN chmod +x /usr/local/bin/*
-
-# Run as a non-root user
-RUN useradd --create-home csi \
-  && chown -R csi: /home/csi
-
-COPY --from=build --chown=csi:csi /home/csi/app /home/csi/app
-
+# app payload (includes node_modules from the build stage)
+COPY --from=build /app /home/csi/app
 WORKDIR /home/csi/app
 
+# mayacli refuses to run as non-root, so we deliberately stay root (no USER).
 EXPOSE 50051
-ENTRYPOINT [ "bin/democratic-csi" ]
+ENTRYPOINT [ "bin/zettalane-csi" ]

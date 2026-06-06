@@ -1,9 +1,5 @@
-**
-
-!/bin
-!/csi_proto
-!/csi_proxy_proto
-!/docker
-!/LICENSE
-!/package*.json
-!/src
+# The Dockerfile runs its own `npm install`; never ship a host-built
+# node_modules into the build context (wrong platform, wastes context bytes).
+node_modules
+.git
+*.log
