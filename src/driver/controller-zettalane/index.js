@@ -1,21 +1,30 @@
+//
+// Copyright (c) 2026 ZettaLane Systems LLC. All rights reserved.
+//
 const _ = require("lodash");
 const { GrpcError, grpc } = require("../../utils/grpc");
 const { CsiBaseDriver } = require("../index");
-const { Mayacli } = require("../../utils/mayacli");
+const { Mayacli, VOL_TYPE, ERRNO } = require("../../utils/mayacli");
+
+// mayacli exits with an errno (e.code); map the surfacing ones to CSI codes.
+const ERRNO_TO_GRPC = {
+  [ERRNO.EPERM]: grpc.status.PERMISSION_DENIED,
+  [ERRNO.ENOENT]: grpc.status.NOT_FOUND,
+  [ERRNO.EBUSY]: grpc.status.FAILED_PRECONDITION,
+  [ERRNO.EEXIST]: grpc.status.ALREADY_EXISTS,
+  [ERRNO.EINVAL]: grpc.status.INVALID_ARGUMENT,
+  [ERRNO.EOPNOTSUPP]: grpc.status.FAILED_PRECONDITION,
+  28: grpc.status.RESOURCE_EXHAUSTED, // ENOSPC
+  13: grpc.status.PERMISSION_DENIED, // EACCES
+};
 
 /**
- * controller-zettalane — CSI driver for the Maya family (MayaNAS / MayaScale) over `mayacli`.
- *
- * ONE class, multiple product drivers selected by `options.driver` (factory.js):
- *   - mayanas         : ZFS backend; StorageClass .parameters.protocol = nfs|smb|iscsi|nvmeof
- *   - mayascale       : md/RAID block; protocol = iscsi|nvmeof   (no snapshot/clone/expand)
- *   - mayanas-lustre  : client mount of the auto-managed `zettafs` (separate caps)
- *
- * Modeled on freenas/api.js (extends CsiBaseDriver, calls a backend client) but the client is
- * `mayacli` (ONC/RPC, no SSH) instead of HTTP. Node attach is the GENERIC node plugin — we only
- * set volume_context.node_attach_driver.
- *
- * STATUS: mayanas + protocol=nfs implemented. Other protocols/products throw UNIMPLEMENTED.
+ * controller-zettalane — CSI driver for ZettaLane products over `mayacli`
+ * (ONC/RPC, no SSH). ONE class, product selected by `options.driver` (factory.js):
+ *   - mayanas        : ZFS; protocol = nfs|smb|iscsi|nvmeof
+ *   - mayascale      : md/RAID block; protocol = iscsi|nvmeof
+ *   - mayanas-lustre : client mount of the auto-managed `zettafs`
+ * Design + mayacli wire format: builder/mayastor/docs/CSI_DRIVER_DESIGN.md.
  */
 class ControllerZettalaneDriver extends CsiBaseDriver {
   constructor(ctx, options) {
@@ -34,92 +43,266 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
     options.service.node.capabilities =
       options.service.node.capabilities || {};
 
-    if (!("rpc" in options.service.identity.capabilities)) {
-      options.service.identity.capabilities.rpc = [
+    // GetPluginCapabilities reads identity.capabilities.service + .volume_expansion (not .rpc)
+    if (!("service" in options.service.identity.capabilities)) {
+      options.service.identity.capabilities.service = [
         "CONTROLLER_SERVICE",
         // "VOLUME_ACCESSIBILITY_CONSTRAINTS",  // enable with the zone_cluster_map port
       ];
+    }
+    if (!("volume_expansion" in options.service.identity.capabilities)) {
+      options.service.identity.capabilities.volume_expansion = ["ONLINE"];
     }
 
     if (!("rpc" in options.service.controller.capabilities)) {
       options.service.controller.capabilities.rpc = [
         "CREATE_DELETE_VOLUME",
+        "LIST_VOLUMES",
+        "GET_CAPACITY", // pool free via `-j show zpool` (root dataset `cle`)
         "CREATE_DELETE_SNAPSHOT",
         "LIST_SNAPSHOTS",
-        "CLONE_VOLUME",
-        "EXPAND_VOLUME", // fs expand needs the configd refquota branch; zvol works today
+        "CLONE_VOLUME", // copy snapshot <vol>@<snap> <newlabel> (zfs clone)
+        "EXPAND_VOLUME", // fs -> zfs set refquota (configd); zvol -> zfs set volsize
+        "GET_VOLUME",
+        "SINGLE_NODE_MULTI_WRITER",
       ];
     }
 
     if (!("rpc" in options.service.node.capabilities)) {
-      options.service.node.capabilities.rpc = [
+      const nodeCaps = [
         "STAGE_UNSTAGE_VOLUME",
-        "EXPAND_VOLUME",
+        "GET_VOLUME_STATS",
+        "SINGLE_NODE_MULTI_WRITER",
       ];
+      // block (zvol) needs node-side resize; a filesystem share grows server-side (no node EXPAND)
+      if (this.getDriverZfsResourceType() === "volume") {
+        nodeCaps.push("EXPAND_VOLUME");
+      }
+      options.service.node.capabilities.rpc = nodeCaps;
+    }
+
+    // wrap every controller RPC: a mayacli errno (or any throw) -> CSI status via toGrpcError
+    for (const m of [
+      "CreateVolume", "DeleteVolume", "ControllerExpandVolume",
+      "CreateSnapshot", "DeleteSnapshot", "ListSnapshots", "ListVolumes",
+      "ControllerGetVolume", "GetCapacity", "ValidateVolumeCapabilities",
+    ]) {
+      const orig = this[m].bind(this);
+      this[m] = async (call) => {
+        try {
+          return await orig(call);
+        } catch (e) {
+          throw this.toGrpcError(e);
+        }
+      };
     }
   }
 
   // ---- helpers --------------------------------------------------------------
 
-  /** mayacli client, configured from the driver Secret (options.mayacli). */
-  getMayacli() {
-    const m = _.get(this.options, "mayacli", {});
-    if (!m.host) {
+  /** Control-plane endpoints from the driver-named config key (`mayanas:"vip1,vip2"`). */
+  endpoints() {
+    const raw = _.get(this.options, this.options.driver);
+    return String(raw || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  /** mayacli client from driver config; `hosts` overrides the endpoint list. */
+  getMayacli(hosts) {
+    const o = this.options || {};
+    // target a specific pool's owning VIP for control ops
+    const eps = hosts && hosts.length ? hosts : this.endpoints();
+    if (!eps.length) {
       throw new GrpcError(
         grpc.status.FAILED_PRECONDITION,
-        "invalid configuration: options.mayacli.host (mgmt endpoint) is required"
+        `invalid configuration: options.${o.driver} (cluster VIP list) is required`
       );
     }
     return new Mayacli({
-      host: m.host,
-      binPath: m.path,
-      timeout: m.timeout,
-      sudo: m.sudo,
+      host: eps,
+      binPath: o.path,
+      timeout: o.timeout,
+      sudo: o.sudo,
       logger: this.ctx.logger,
     });
   }
 
+  /** Map a mayacli error (e.code = errno) to a CSI GrpcError; pass GrpcErrors through. */
+  toGrpcError(e, prefix) {
+    if (e instanceof GrpcError) return e;
+    const code =
+      ERRNO_TO_GRPC[e && e.code] != null ? ERRNO_TO_GRPC[e.code] : grpc.status.INTERNAL;
+    const msg = (e && e.message) || String(e);
+    return new GrpcError(code, prefix ? `${prefix}: ${msg}` : msg);
+  }
+
   /**
-   * Resolve a pool to {clusterid, server(=data VIP)}, two sources in order:
-   *  1. explicit driver config options.pools[pool] (the TF csi_backend handoff); or
-   *  2. live DISCOVERY via mayacli — clusterid = the zpool's cid, vip = the failover node
-   *     whose mapid == that clusterid (single-node/no-HA -> fall back to the mgmt host).
-   * (2) lets the Secret carry only mayacli.host (Trident-style), decoupling the K8s admin
-   * from the MayaNAS terraform state. Cached per pool for the controller's lifetime.
+   * Resolve a pool to {clusterid, server(=data VIP), kind}: pinned override
+   * (options.pools[pool]) else live discovery (buildPoolView).
    */
   async resolvePool(pool, mayacli) {
     const cfg = _.get(this.options, ["pools", pool]);
     if (cfg && cfg.clusterid != null && cfg.vip) {
-      return { clusterid: cfg.clusterid, server: cfg.vip };
+      // kind: prefer a live probe (authoritative); fall back to configured/zpool.
+      let kind;
+      try {
+        kind = (await (mayacli || this.getMayacli()).getPoolInfo(pool)).kind;
+        if (cfg.kind && cfg.kind !== kind) {
+          this.ctx.logger.warn(
+            `pool '${pool}': configured kind=${cfg.kind} but discovered '${kind}'; using discovered`
+          );
+        }
+      } catch (e) {
+        kind = cfg.kind || "zpool";
+      }
+      return { clusterid: cfg.clusterid, server: cfg.vip, kind };
     }
-    this._poolCache = this._poolCache || {};
-    if (this._poolCache[pool]) return this._poolCache[pool];
 
-    mayacli = mayacli || this.getMayacli();
-    let clusterid, server;
-    try {
-      clusterid = await mayacli.getPoolClusterid(pool);
-      const fo = await mayacli.showFailover();
-      server = fo.byMapid[String(clusterid)] || _.get(this.options, "mayacli.host");
-    } catch (e) {
+    const view = await this.buildPoolView();
+    const rec = pool
+      ? view.find((p) => p.name === pool)
+      : view.find((p) => p.default) || (view.length === 1 ? view[0] : null);
+    if (!rec) {
       throw new GrpcError(
         grpc.status.INVALID_ARGUMENT,
-        `pool '${pool}' not in driver config and discovery failed (${e.message}); set ` +
-          `options.pools[${pool}]={clusterid,vip} or ensure the zpool exists on the cluster`
+        pool
+          ? `pool '${pool}' not found on any ${this.options.driver} endpoint (${this.endpoints().join(",")})`
+          : `no StorageClass 'pool' parameter and no unique default among ${view.length} discovered pool(s)`
       );
     }
-    if (!server) {
-      throw new GrpcError(
-        grpc.status.INVALID_ARGUMENT,
-        `pool '${pool}': could not determine data VIP (failover empty and no mayacli.host)`
-      );
-    }
-    const resolved = { clusterid, server };
-    this._poolCache[pool] = resolved;
-    return resolved;
+    return { clusterid: rec.clusterid, server: rec.vip, kind: rec.kind };
   }
 
-  /** Resolve the access protocol for this volume (PowerStore-style param within mayanas). */
+  /**
+   * Discover all pools ONCE from a single endpoint (configd is cluster-aware).
+   * vip = byMapid[clusterid] from `show failover` is the single source of truth
+   * (control + data). Cached; concurrent callers share _poolViewPromise so they
+   * cannot cache divergent VIPs. Record {name,clusterid,vip,kind,source,default}.
+   */
+  async buildPoolView() {
+    if (this._poolView) return this._poolView;
+    // one discovery, others await it; clear on failure so a partial view is never cached
+    if (!this._poolViewPromise) {
+      this._poolViewPromise = this._discoverPools().then(
+        (pools) => {
+          this._poolView = pools;
+          this._poolViewPromise = null;
+          return pools;
+        },
+        (e) => {
+          this._poolViewPromise = null;
+          throw e;
+        }
+      );
+    }
+    return this._poolViewPromise;
+  }
+
+  async _discoverPools() {
+    // only true provisioning pools (zpool/vg/thinpool); NOT V_RG (md backing, never a
+    // CSI target) -- see CSI_DRIVER_DESIGN.md
+    const POOL_KIND = {
+      [VOL_TYPE.ZPOOL]: "zpool",
+      [VOL_TYPE.VG]: "vg",
+      [VOL_TYPE.THINPOOL]: "thinpool", // LVM thin pool -> `thinpool=<pool>` (thin LVs)
+    };
+    const mayacli = this.getMayacli(); // full endpoint list -> reachability failover
+    const vols = await mayacli.showVolumes(); // every pool (cluster-aware)
+    const fo = await mayacli.showFailover(); // authoritative clusterid -> VIP
+    const eps = this.endpoints();
+    const pools = [];
+    for (const v of vols) {
+      const kind = POOL_KIND[v.t];
+      if (!kind) continue; // not a pool
+      const clusterid = Number(v.cid);
+      // VIP from the authoritative failover map; single-endpoint fallback only when no HA
+      const vip =
+        (fo.byMapid && fo.byMapid[String(clusterid)]) ||
+        (eps.length === 1 ? eps[0] : null);
+      if (!vip) {
+        throw new GrpcError(
+          grpc.status.UNAVAILABLE,
+          `pool '${v.l}' (clusterid ${clusterid}): no failover VIP yet; discovery incomplete`
+        );
+      }
+      pools.push({ name: v.l, clusterid, vip, kind, source: "discovered" });
+    }
+    const perVip = {};
+    for (const p of pools) perVip[p.vip] = (perVip[p.vip] || 0) + 1;
+    for (const p of pools) p.default = perVip[p.vip] === 1;
+    this.ctx.logger.verbose("discovered pools: %j", pools);
+    return pools;
+  }
+
+  /**
+   * Backing resource type, fixed per driver: NAS (NFS/SMB/Lustre) -> filesystem
+   * dataset; block (nvme-of/iscsi) -> zvol. Drives create, mapping type, node EXPAND.
+   */
+  getDriverZfsResourceType() {
+    switch (this.options.driver) {
+      case "mayanas":
+      case "mayanas-lustre":
+        return "filesystem";
+      case "mayascale":
+        return "volume";
+      default:
+        throw new Error("unknown driver: " + this.options.driver);
+    }
+  }
+
+  /** mayacli volume types this driver manages: fs -> V_FILESYS; block -> V_FLEX|V_BLOCK|V_ZVOL. */
+  driverVolTypes() {
+    return this.getDriverZfsResourceType() === "filesystem"
+      ? [VOL_TYPE.FILESYS]
+      : [VOL_TYPE.FLEX, VOL_TYPE.BLOCK, VOL_TYPE.ZVOL];
+  }
+
+  /** CSI access modes accepted (NAS share = multi-writer; block = single-node). */
+  getAccessModes() {
+    if (this.getDriverZfsResourceType() === "filesystem") {
+      return [
+        "UNKNOWN", "SINGLE_NODE_WRITER", "SINGLE_NODE_SINGLE_WRITER",
+        "SINGLE_NODE_MULTI_WRITER", "SINGLE_NODE_READER_ONLY",
+        "MULTI_NODE_READER_ONLY", "MULTI_NODE_SINGLE_WRITER", "MULTI_NODE_MULTI_WRITER",
+      ];
+    }
+    return [
+      "UNKNOWN", "SINGLE_NODE_WRITER", "SINGLE_NODE_SINGLE_WRITER",
+      "SINGLE_NODE_MULTI_WRITER", "SINGLE_NODE_READER_ONLY",
+      "MULTI_NODE_READER_ONLY", "MULTI_NODE_SINGLE_WRITER",
+    ];
+  }
+
+  /** Validate requested volume_capabilities for this backend. */
+  assertCapabilities(capabilities) {
+    const rt = this.getDriverZfsResourceType();
+    let message = null;
+    const modes = this.getAccessModes();
+    const valid = (capabilities || []).every((capability) => {
+      if (rt === "filesystem" && capability.access_type && capability.access_type != "mount") {
+        message = `invalid access_type ${capability.access_type}`;
+        return false;
+      }
+      if (
+        rt === "filesystem" &&
+        capability.mount &&
+        capability.mount.fs_type &&
+        !["nfs", "cifs"].includes(capability.mount.fs_type)
+      ) {
+        message = `invalid fs_type ${capability.mount.fs_type}`;
+        return false;
+      }
+      if (capability.access_mode && !modes.includes(capability.access_mode.mode)) {
+        message = `invalid access_mode ${capability.access_mode.mode}`;
+        return false;
+      }
+      return true;
+    });
+    return { valid, message };
+  }
+
   getProtocol(call) {
     const driver = this.options.driver;
     if (driver === "mayanas-lustre") return "lustre";
@@ -145,14 +328,9 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
     return v;
   }
 
-  /** Build the NFS export options, ensuring fsid=<clusterid> for NFSv4 failover. */
-  buildNfsOptions(rawOpts, clusterid) {
-    let opts = rawOpts || "*(rw,sync,no_root_squash)";
-    if (!/fsid=/.test(opts)) {
-      // insert fsid before the final ')'  (matches cluster_setup2.sh)
-      opts = opts.replace(/\)\s*$/, `,fsid=${clusterid})`);
-    }
-    return opts;
+  /** NFS export options. fsid is owned by configd (client fsid= is stripped). */
+  buildNfsOptions(rawOpts) {
+    return rawOpts || "*(rw,sync,no_root_squash)";
   }
 
   capacityFromCall(call) {
@@ -182,13 +360,23 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
 
   // ---- controller RPCs ------------------------------------------------------
 
+  /** protocol -> {access, mapping controller, node_attach_driver}. nfs/nvme-of ready. */
+  static PROTO = {
+    nfs: { access: "filesystem", controller: "nfs", attach: "nfs", ready: true },
+    smb: { access: "filesystem", controller: "smb", attach: "smb", ready: false },
+    iscsi: { access: "block", controller: "iscsi", attach: "iscsi", ready: false },
+    "nvme-of": { access: "block", controller: "nvmet-tcp", attach: "nvmeof", ready: true },
+    nvmeof: { access: "block", controller: "nvmet-tcp", attach: "nvmeof", ready: true },
+  };
+
   async CreateVolume(call) {
     const driver = this;
     const protocol = this.getProtocol(call);
-    if (this.options.driver !== "mayanas" || protocol !== "nfs") {
+    const pp = ControllerZettalaneDriver.PROTO[protocol];
+    if (!pp || !pp.ready) {
       throw new GrpcError(
         grpc.status.UNIMPLEMENTED,
-        `driver=${this.options.driver} protocol=${protocol} not implemented yet (mayanas/nfs only)`
+        `protocol '${protocol}' not implemented yet (nfs, nvme-of)`
       );
     }
 
@@ -199,58 +387,160 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
       throw new GrpcError(grpc.status.INVALID_ARGUMENT, "missing volume_capabilities");
     }
 
-    const mayacli = this.getMayacli();
     const label = await driver.getVolumeIdFromCall(call); // sanitized pvc name
     const pool = this.reqParam(call, "pool");
-    // clusterid + data VIP come from the driver config (TF csi_backend handoff) OR are
-    // discovered live from the cluster via mayacli (Trident-style) — see resolvePool().
-    const { clusterid, server } = await this.resolvePool(pool, mayacli);
+    // server = the pool's owning VIP: control RPCs target it AND it is volume_context.server
+    const { clusterid, server, kind } = await this.resolvePool(pool);
+    const mayacli = this.getMayacli([server]);
     const recordsize = _.get(call, "request.parameters.recordsize", "128K");
+    // thick by default; thin is opt-in (zfs drops refreservation, LVM uses a thin pool)
+    const thin = String(_.get(call, "request.parameters.thin", "")).toLowerCase() === "true";
     const capacity_bytes = this.capacityFromCall(call);
 
-    const vol = `${pool}-${label}`; // pool-prefixed volname (avoids cross-pool collisions)
+    // mayacli label: a zpool prefixes <pool>-<label>; a VG uses the bare label.
+    const vol = kind === "zpool" ? `${pool}-${label}` : label;
     const share = `/${pool}/${label}`;
     const content_source = call.request.volume_content_source;
 
-    // idempotency: if the volume already exists, return success (assume same spec)
+    // exact-fit idempotency: pvcname + capacity + active export must match (partial-failure self-heal)
+    let deferExport = false;
     const exists = await mayacli.volumeExists(vol);
-    if (!exists) {
+    if (exists) {
+      // same name + different capacity = ALREADY_EXISTS conflict
+      const existing = await this.existingCapacity(vol, mayacli);
+      if (existing && Number(existing) !== Number(capacity_bytes)) {
+        throw new GrpcError(
+          grpc.status.ALREADY_EXISTS,
+          `volume '${vol}' already exists with capacity ${existing} (requested ${capacity_bytes})`
+        );
+      }
+    } else {
+      // a content-source VOLUME must exist (a missing snapshot surfaces as ENOENT->NOT_FOUND)
+      if (
+        content_source &&
+        content_source.volume &&
+        !(await mayacli.volumeExists(content_source.volume.volume_id))
+      ) {
+        throw new GrpcError(
+          grpc.status.NOT_FOUND,
+          `source volume '${content_source.volume.volume_id}' not found`
+        );
+      }
       if (content_source && content_source.snapshot) {
-        // CLONE_VOLUME from a snapshot
+        // clone from snapshot: form the per-kind mayacli snap id; configd creates the target
+        const sid = content_source.snapshot.snapshot_id;
+        const at = sid.lastIndexOf("@");
+        const srcVol = at >= 0 ? sid.slice(0, at) : sid;
+        const snap = at >= 0 ? sid.slice(at + 1) : sid;
+        const { srcKind } = await mayacli.volSrcInfo(srcVol);
+        // vg clone target is filled by async dd -> defer export to node-stage
+        if (srcKind === "vg") deferExport = true;
         await mayacli.createVolumeFromSnapshot({
           label,
-          pool,
-          clusterid,
-          snapshotof: content_source.snapshot.snapshot_id,
-          sizeG: Math.ceil(capacity_bytes / 1024 ** 3),
+          snapshotof: Mayacli.snapName(srcKind, srcVol, snap),
+          vol: srcKind === "vg" ? undefined : vol,
+          sizeG: srcKind === "vg" ? undefined : Math.ceil(capacity_bytes / 1024 ** 3),
+        });
+      } else if (content_source && content_source.volume) {
+        // clone from a volume: snapshot the source first, then clone it
+        const srcVol = content_source.volume.volume_id;
+        const { srcKind, sizeBytes } = await mayacli.volSrcInfo(srcVol);
+        const snap = `clonesnap-${label}`;
+        const sopts = { name: snap, vol: srcVol };
+        if (srcKind === "vg")
+          sopts.size = `${Math.max(1, Math.ceil((sizeBytes * 25) / 100 / (1024 * 1024)))}M`;
+        await mayacli.createSnapshot(sopts);
+        if (srcKind === "vg") deferExport = true;
+        await mayacli.createVolumeFromSnapshot({
+          label,
+          snapshotof: Mayacli.snapName(srcKind, srcVol, snap),
+          vol: srcKind === "vg" ? undefined : vol,
+          sizeG: srcKind === "vg" ? undefined : Math.ceil(capacity_bytes / 1024 ** 3),
         });
       } else {
-        await mayacli.createZfsVolume({
-          pool,
+        // fresh create: filesystem -> V_FILESYS, block -> V_FLEX (thick unless thin)
+        await mayacli.createVolume({
           label,
-          clusterid,
+          container: { kind, name: pool },
+          access: pp.access,
+          sizeBytes: capacity_bytes,
           recordsize,
-          refquotaBytes: capacity_bytes,
+          thin,
+          clusterid,
         });
       }
-      await mayacli.createMapping({
-        vol,
-        controller: "nfs",
-        clusterid,
-        options: this.buildNfsOptions(
-          _.get(call, "request.parameters.nfsOptions"),
-          clusterid
-        ),
-      });
-      await mayacli.bindMapping(vol);
-      await mayacli.save();
     }
 
-    const volume_context = {
-      node_attach_driver: "nfs",
-      server: server,
-      share: share,
-    };
+    // ensure the export exists AND is active; idempotent (rebuild only what's missing)
+    if (!deferExport) {
+     try {
+      const maps = await mayacli.showMapping(vol);
+      if (!maps.some((m) => m.a)) {
+        if (pp.access !== "filesystem") {
+          // nvme-of: per-PVC portal + subsystem + namespace, replicated to the peer (get-or-create)
+          const nqn = Mayacli.csiNqn(vol);
+          const have = (await mayacli.showSubsystems()).find((s) => s.nqn === nqn);
+          const portal =
+            have && have.portalTag != null
+              ? { tag: have.portalTag, port: have.portalPort }
+              : await mayacli.createPortalAuto(server);
+          if (!have) await mayacli.createSubsystem(nqn, portal.tag);
+          const peer = this.endpoints().find((e) => e !== server);
+          if (peer) {
+            const peerCli = this.getMayacli([peer]);
+            await peerCli.createPortal(portal.tag, server, portal.port);
+            await peerCli.createSubsystem(nqn, portal.tag);
+          }
+          if (!maps.length) {
+            await mayacli.createMapping({
+              vol,
+              controller: pp.controller, // nvmet-tcp
+              clusterid,
+              // targetid = portal tag -> per-PVC kernel port-dir (else all reuse port-dir 0)
+              extra: [`nodename=${nqn}`, "lun=1", `targetid=${portal.tag}`],
+            });
+          }
+        } else if (!maps.length) {
+          // filesystem shares carry NFS export options.
+          await mayacli.createMapping({
+            vol,
+            controller: pp.controller,
+            clusterid,
+            options: this.buildNfsOptions(_.get(call, "request.parameters.nfsOptions")),
+          });
+        }
+        // bind on the owning VIP (mayacli targets server == byMapid[clusterid]); idempotent.
+        await mayacli.bindMapping(vol, clusterid);
+      }
+      await mayacli.save();
+     } catch (e) {
+       // CSI_DEBUG_PANIC=1: freeze on first failure (see docs/mayanas/csi-debug-panic.md)
+       if (process.env.CSI_DEBUG_PANIC) {
+         console.error(`[CSI_PANIC] export/mapping failed vol=${vol} clusterid=${clusterid}: ${e && e.message}`);
+         process.exit(42);
+       }
+       throw e;
+     }
+    }
+
+    // volume_context per access type
+    let volume_context;
+    if (pp.access === "filesystem") {
+      volume_context = { node_attach_driver: pp.attach, server, share };
+    } else {
+      // nvme-of: nqn + nsid from the bound mapping; listener port = the per-PVC portal's port
+      const m = (await mayacli.showMapping(vol)).find((x) => x.n) || {};
+      const nqn = m.n || Mayacli.csiNqn(vol);
+      const sub = (await mayacli.showSubsystems()).find((s) => s.nqn === nqn);
+      const port = sub && sub.portalPort ? sub.portalPort : 4420;
+      volume_context = {
+        node_attach_driver: "nvmeof",
+        transport: "tcp",
+        transports: `tcp://${server}:${port}`,
+        nqn,
+        nsid: String(m.l != null ? m.l : 1),
+      };
+    }
 
     let accessible_topology;
     if (typeof this.getAccessibleTopology === "function") {
@@ -284,9 +574,36 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
     }
 
     const mayacli = this.getMayacli();
-    // unbind -> delete mapping -> delete volume (all idempotent: ignore ENOENT)
-    await mayacli.unbindMapping(vol);
+
+    // clusterid for unbind comes from resolvePool (pool parsed from the device path), not the mapping
+    const m = (await mayacli.showMapping(vol)).find((x) => x.n) || {};
+    let clusterid = null;
+    const vgm = /^\/dev\/([^/]+)\//.exec(m.d || "");
+    if (vgm) {
+      try {
+        clusterid = (await this.resolvePool(vgm[1])).clusterid;
+      } catch (e) {
+        /* pool not resolvable (already gone / not cached) -- unbind without clusterid */
+      }
+    }
+
+    // unbind (with the resolved clusterid) -> delete mapping. (idempotent: ignore ENOENT/EINVAL)
+    await mayacli.unbindMapping(vol, clusterid);
     await mayacli.deleteMapping(vol);
+
+    // nvme-of: tear down the per-PVC subsystem + portal on every endpoint (HA pair holds both)
+    if (m.n) {
+      // portal tag = mapping tid (captured pre-delete); fall back to the subsystem parse
+      const sub = (await mayacli.showSubsystems()).find((s) => s.nqn === m.n);
+      const portalTag =
+        m.t != null ? m.t : sub && sub.portalTag != null ? sub.portalTag : null;
+      for (const ep of this.endpoints()) {
+        const cli = this.getMayacli([ep]);
+        await cli.deleteSubsystem(m.n);
+        if (portalTag != null) await cli.deletePortal(portalTag);
+      }
+    }
+
     await mayacli.deleteVolume(vol);
     await mayacli.save();
     return {};
@@ -305,9 +622,12 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
       sizeG: Math.ceil(capacity_bytes / 1024 ** 3),
     });
     await mayacli.save();
+    // block (zvol/vg) needs a node-side device rescan + fs resize after the server-side
+    // size bump; an NFS/SMB share grows server-side via refquota (no node action). This must
+    // match the node EXPAND_VOLUME cap, which is advertised only for resource type "volume".
     return {
       capacity_bytes: capacity_bytes,
-      node_expansion_required: false, // nfs: server-side quota, no node action
+      node_expansion_required: this.getDriverZfsResourceType() === "volume",
     };
   }
 
@@ -321,14 +641,41 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
       );
     }
     const mayacli = this.getMayacli();
-    await mayacli.createSnapshot({ name, vol: source_volume_id });
+    // CSI snapshot_id is uniform "<source>@<name>"; mayacli id is per-kind (Mayacli.snapName)
+    const snapshot_id = `${source_volume_id}@${name}`;
+    const { srcKind, sizeBytes } = await mayacli.volSrcInfo(source_volume_id);
+    const mayaSnap = Mayacli.snapName(srcKind, source_volume_id, name);
+    let sin = await mayacli.showSnapshots(source_volume_id);
+    let s = sin.find((x) => x.l === mayaSnap);
+    if (!s) {
+      // not on this source -> create (snapshot_id unique by construction; re-create idempotent)
+      const opts = { name, vol: source_volume_id };
+      if (srcKind === "vg") {
+        // a thick LVM snapshot needs a CoW area; default 25% of the source size
+        const cowMiB = Math.max(1, Math.ceil((sizeBytes * 25) / 100 / (1024 * 1024)));
+        opts.size = `${cowMiB}M`;
+      }
+      try {
+        await mayacli.createSnapshot(opts);
+      } catch (e) {
+        // CSI_DEBUG_PANIC=1: freeze on create failure, skipping the known maxlen/EEXIST cases
+        if (process.env.CSI_DEBUG_PANIC && name.length <= 127 && !/rc=17\b/.test(String(e && e.message))) {
+          console.error(`[CSI_PANIC] CreateSnapshot failed name=${name} src=${source_volume_id} kind=${srcKind}: ${e && e.message}`);
+          process.exit(43);
+        }
+        throw e;
+      }
+      sin = await mayacli.showSnapshots(source_volume_id);
+      s = sin.find((x) => x.l === mayaSnap) || {};
+    }
+    // (already exists on this source -> idempotent return of the existing snapshot)
     return {
       snapshot: {
-        snapshot_id: name,
-        source_volume_id: source_volume_id,
-        creation_time: { seconds: Math.floor(Date.now() / 1000), nanos: 0 },
+        snapshot_id,
+        source_volume_id,
+        creation_time: { seconds: Number(s.ct) || Math.floor(Date.now() / 1000), nanos: 0 },
         ready_to_use: true,
-        size_bytes: 0,
+        size_bytes: Number(s.c) || 0,
       },
     };
   }
@@ -339,19 +686,184 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
       throw new GrpcError(grpc.status.INVALID_ARGUMENT, "snapshot_id is required");
     }
     const mayacli = this.getMayacli();
+    // source may be gone so we can't query the kind -> try both @-qualified and bare forms
+    const at = snapshot_id.lastIndexOf("@");
+    const bare = at >= 0 ? snapshot_id.slice(at + 1) : snapshot_id;
     await mayacli.deleteSnapshot(snapshot_id);
+    if (bare !== snapshot_id) await mayacli.deleteSnapshot(bare);
     return {};
   }
 
+  /**
+   * ListSnapshots: snapshot_id (one) / source_volume_id (per-volume) / neither
+   * (global enumerate). No pagination (all entries returned).
+   */
+  async ListSnapshots(call) {
+    const mayacli = this.getMayacli();
+    const req = call.request;
+    // re-encode the per-kind mayacli id back to the uniform CSI snapshot_id
+    const toEntry = (s, src) => ({
+      snapshot: {
+        snapshot_id: String(s.l).includes("@") ? s.l : `${src}@${s.l}`,
+        source_volume_id: src,
+        creation_time: { seconds: Number(s.ct) || 0, nanos: 0 },
+        ready_to_use: true,
+        size_bytes: Number(s.c) || 0,
+      },
+    });
+
+    let entries = [];
+    if (req.snapshot_id) {
+      const at = req.snapshot_id.lastIndexOf("@");
+      if (at > 0) {
+        const src = req.snapshot_id.slice(0, at);
+        const bare = req.snapshot_id.slice(at + 1);
+        const sin = await mayacli.showSnapshots(src);
+        entries = sin
+          .filter((s) => s.l === req.snapshot_id || s.l === bare)
+          .map((s) => toEntry(s, src));
+      }
+    } else if (req.source_volume_id) {
+      const sin = await mayacli.showSnapshots(req.source_volume_id);
+      entries = sin.map((s) => toEntry(s, req.source_volume_id));
+    } else {
+      const vols = await mayacli.showVolumes();
+      const types = this.driverVolTypes();
+      for (const v of vols) {
+        // only this driver's real user volumes (hide __* pseudo entities)
+        if (!types.includes(v.t) || String(v.l).startsWith("__")) continue;
+        // a volume that can't be listed right now (gone mid-enum) must not fail the whole list
+        let sin;
+        try {
+          sin = await mayacli.showSnapshots(v.l);
+        } catch (e) {
+          continue;
+        }
+        for (const s of sin) entries.push(toEntry(s, v.l));
+      }
+    }
+    return this._paginate(entries, req);
+  }
+
+  /** GetCapacity: pool free space (zpool root `cle`, or vg free). */
+  async GetCapacity(call) {
+    if (call.request.volume_capabilities) {
+      const result = this.assertCapabilities(call.request.volume_capabilities);
+      if (result.valid !== true) {
+        return { available_capacity: 0 };
+      }
+    }
+    const pool = _.get(call, "request.parameters.pool");
+    if (!pool) {
+      return { available_capacity: 0 };
+    }
+    const mayacli = this.getMayacli();
+    // kind-appropriate pool-free query: zpool root `cle`, or vg free
+    const { kind } = await this.resolvePool(pool, mayacli);
+    if (kind === "zpool") {
+      const zp = await mayacli.showZpool(pool);
+      const root =
+        zp && Array.isArray(zp.zv) ? zp.zv.find((d) => d.n === pool) : null;
+      return { available_capacity: root ? Number(root.cle) : 0 };
+    }
+    // vg (LVM / md raidgroup)
+    const free = await mayacli.vgFree(pool);
+    return { available_capacity: Number(free) || 0 };
+  }
+
+  /** Provisioned capacity (bytes) of an existing volume from show-vol `c`; 0 if absent. */
+  async existingCapacity(vol, mayacli) {
+    const v = (await mayacli.showVolumes()).find((x) => x.l === vol);
+    // `c` == vol_size (refquota for fs / volsize for block)
+    return v ? Number(v.c) || 0 : 0;
+  }
+
+  /** CSI list pagination over a full entries array (index-based starting_token). */
+  _paginate(entries, req) {
+    let start = 0;
+    if (req && req.starting_token) {
+      start = Number(req.starting_token);
+      if (!Number.isInteger(start) || start < 0 || start > entries.length) {
+        throw new GrpcError(
+          grpc.status.ABORTED,
+          `invalid starting_token: ${req.starting_token}`
+        );
+      }
+    }
+    const max = Number(req && req.max_entries) || 0;
+    const end = max > 0 ? start + max : entries.length;
+    return {
+      entries: entries.slice(start, end),
+      next_token: end < entries.length ? String(end) : "",
+    };
+  }
+
+  /** ControllerGetVolume: one volume by id; capacity from show-vol `c`, share = `d`. */
+  async ControllerGetVolume(call) {
+    const vol = call.request.volume_id;
+    if (!vol) {
+      throw new GrpcError(grpc.status.INVALID_ARGUMENT, "volume_id is required");
+    }
+    const mayacli = this.getMayacli();
+    const v = (await mayacli.showVolumes()).find((x) => x.l === vol);
+    if (!v) {
+      throw new GrpcError(grpc.status.NOT_FOUND, `volume ${vol} not found`);
+    }
+    const isFs = this.getDriverZfsResourceType() === "filesystem";
+    return {
+      volume: {
+        volume_id: vol,
+        capacity_bytes: Number(v.c) || 0, // c == vol_size (refquota fs / volsize block)
+        volume_context: isFs
+          ? { node_attach_driver: "nfs", share: v.d }
+          : { node_attach_driver: "nvmeof" },
+      },
+    };
+  }
+
+  /** ListVolumes: this driver's managed volumes (exclude __* and snapshots). No pagination. */
+  async ListVolumes(call) {
+    const mayacli = this.getMayacli();
+    const isFs = this.getDriverZfsResourceType() === "filesystem";
+    const types = this.driverVolTypes();
+    const entries = (await mayacli.showVolumes())
+      .filter((v) => types.includes(v.t) && !String(v.l).startsWith("__"))
+      .map((v) => ({
+        volume: {
+          // `c` == vol_size (refquota for fs / volsize for block) = provisioned size
+          volume_id: v.l,
+          capacity_bytes: Number(v.c) || 0,
+          volume_context: isFs
+            ? { node_attach_driver: "nfs", share: v.d }
+            : { node_attach_driver: "nvmeof" },
+        },
+      }));
+    return this._paginate(entries, call.request);
+  }
+
   async ValidateVolumeCapabilities(call) {
-    const result = this.assertCapabilities(call.request.volume_capabilities || []);
+    const vol = call.request.volume_id;
+    if (!vol) {
+      throw new GrpcError(grpc.status.INVALID_ARGUMENT, "volume_id is required");
+    }
+    const caps = call.request.volume_capabilities;
+    if (!caps || caps.length === 0) {
+      throw new GrpcError(
+        grpc.status.INVALID_ARGUMENT,
+        "volume_capabilities are required"
+      );
+    }
+    if (!(await this.getMayacli().volumeExists(vol))) {
+      throw new GrpcError(grpc.status.NOT_FOUND, `volume ${vol} not found`);
+    }
+    const result = this.assertCapabilities(caps);
     if (result.valid !== true) {
       return { message: result.message };
     }
     return {
       confirmed: {
         volume_context: call.request.volume_context,
-        volume_capabilities: call.request.volume_capabilities,
+        volume_capabilities: caps,
         parameters: call.request.parameters,
       },
     };
