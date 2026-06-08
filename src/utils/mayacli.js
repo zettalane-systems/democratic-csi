@@ -167,6 +167,8 @@ class Mayacli {
       // block (V_FLEX): zvol on a zpool, or LV on a VG
       args.push(a.thin && a.thinpool ? `thinpool=${a.thinpool}` : container);
       if (a.sizeBytes) args.push(`size=${a.sizeBytes}`);
+      // add zpool zvol sparse option if thin requested
+      if (kind === "zpool" && a.thin) args.push(Mayacli.opt('"-s"'));
       if (a.clusterid != null) args.push(`clusterid=${a.clusterid}`);
     }
     // idempotency is the caller's job (check-first); a stray EEXIST is a real race -> surface it
