@@ -145,17 +145,30 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
   async resolvePool(pool, mayacli) {
     const cfg = _.get(this.options, ["pools", pool]);
     if (cfg && cfg.clusterid != null && cfg.vip) {
-      // kind: prefer a live probe (authoritative); fall back to configured/zpool.
-      let kind;
+      // kind: prefer a live probe (authoritative). Never guess on failure.
+      let kind, probed = false;
       try {
         kind = (await (mayacli || this.getMayacli()).getPoolInfo(pool)).kind;
-        if (cfg.kind && cfg.kind !== kind) {
-          this.ctx.logger.warn(
-            `pool '${pool}': configured kind=${cfg.kind} but discovered '${kind}'; using discovered`
+        probed = true;
+      } catch (e) {
+        // Probe failed -> the kind is genuinely unknown (it could be any of
+        // zpool/vg/thinpool). Honor an explicit configured kind if the user asserted
+        // one; otherwise reject -- do NOT assume a default like zpool.
+        if (!cfg.kind) {
+          throw new GrpcError(
+            grpc.status.FAILED_PRECONDITION,
+            `pool '${pool}': cannot determine pool kind -- ${e.message}`
           );
         }
-      } catch (e) {
-        kind = cfg.kind || "zpool";
+        kind = cfg.kind;
+      }
+      // A user-pinned kind that disagrees with the probed pool cannot be honored --
+      // reject rather than silently substituting the discovered kind.
+      if (probed && cfg.kind && cfg.kind !== kind) {
+        throw new GrpcError(
+          grpc.status.INVALID_ARGUMENT,
+          `pool '${pool}': requested kind=${cfg.kind} but the pool is '${kind}'`
+        );
       }
       return { clusterid: cfg.clusterid, server: cfg.vip, kind };
     }
@@ -173,6 +186,39 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
       );
     }
     return { clusterid: rec.clusterid, server: rec.vip, kind: rec.kind };
+  }
+
+  /**
+   * Owning VIP of an existing volume/snapshot. Mutating ops (Delete/Expand/Snapshot) get NO
+   * pool in the CSI request -- unlike CreateVolume, which is handed the StorageClass pool and
+   * pins via resolvePool. They must derive the owner from the object itself: its `cid` is on
+   * the voldb entry and is returned by ANY node (peer-synced), and byMapid[cid] is the floating
+   * owner VIP. Control MUTATIONS must pin here -- an unpinned call lands on the first VIP, finds
+   * the entry via the synced voldb (looks valid), and runs the backend op on a VG that node
+   * doesn't have. Reads stay node-agnostic. Returns null if the object is gone (caller then
+   * proceeds best-effort -- fine for idempotent deletes).
+   */
+  async ownerServer(probe, id) {
+    const v = await probe.showVolume(id); // targeted lookup (the object carries its own cid)
+    if (!v) {
+      // genuinely gone -> caller proceeds best-effort (idempotent delete / its own NOT_FOUND)
+      this.ctx.logger.warn(`ownerServer: '${id}' not found on probe -> null (caller falls back to first VIP)`);
+      return null;
+    }
+    // The object EXISTS, so its owner MUST be resolvable. A mutation must NEVER fall through to an
+    // arbitrary (first) VIP -- that silently runs the backend op on a node that lacks the pool and
+    // either errors ("No such file or directory") or, worse, mutates the wrong place. Fail loudly.
+    const { byMapid } = await probe.showFailover();
+    const server = v.cid != null ? byMapid[String(v.cid)] : null;
+    if (!server) {
+      this.ctx.logger.warn(`ownerServer: '${id}' cid=${v.cid} has no VIP in byMapid=${JSON.stringify(byMapid)}`);
+      throw new GrpcError(
+        grpc.status.FAILED_PRECONDITION,
+        `cannot locate the owning node for '${id}' (cid=${v.cid}); refusing to route a mutation to an arbitrary node`
+      );
+    }
+    this.ctx.logger.verbose(`ownerServer: '${id}' cid=${v.cid} -> ${server}`);
+    return server;
   }
 
   /**
@@ -394,7 +440,23 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
     const mayacli = this.getMayacli([server]);
     const recordsize = _.get(call, "request.parameters.recordsize", "128K");
     // thick by default; thin is opt-in (zfs drops refreservation, LVM uses a thin pool)
-    const thin = String(_.get(call, "request.parameters.thin", "")).toLowerCase() === "true";
+    const thinRaw = _.get(call, "request.parameters.thin"); // undefined if not specified
+    const thin = String(thinRaw ?? "").toLowerCase() === "true";
+    // Reject thin/kind combinations that cannot be honored -- don't silently override the
+    // user's request. A vg is thick-only; a thinpool is thin-only; only zpool serves both.
+    // An absent thin follows the kind's default; only an explicit contradicting value fails.
+    if (kind === "vg" && thin) {
+      throw new GrpcError(
+        grpc.status.INVALID_ARGUMENT,
+        `pool '${pool}' is a thick VG; thin provisioning is not supported (use a thinpool pool)`
+      );
+    }
+    if (kind === "thinpool" && thinRaw !== undefined && !thin) {
+      throw new GrpcError(
+        grpc.status.INVALID_ARGUMENT,
+        `pool '${pool}' is a thinpool; thick provisioning (thin:false) is not supported`
+      );
+    }
     const capacity_bytes = this.capacityFromCall(call);
 
     // mayacli label: a zpool prefixes <pool>-<label>; a VG uses the bare label.
@@ -573,21 +635,22 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
       return {};
     }
 
-    const mayacli = this.getMayacli();
+    // Pin every mutation to the volume's OWNER. Unpinned, the call lands on the first VIP and
+    // the peer-synced voldb makes it look valid -- but unbind/delete then run on a VG that node
+    // doesn't have. (DeleteVolume gets no pool, so derive the owner from the volume's cid.)
+    const probe = this.getMayacli();
+    const server = await this.ownerServer(probe, vol);
+    const mayacli = server ? this.getMayacli([server]) : probe;
 
-    // clusterid for unbind comes from resolvePool (pool parsed from the device path), not the mapping
-    const m = (await mayacli.showMapping(vol)).find((x) => x.n) || {};
-    let clusterid = null;
-    const vgm = /^\/dev\/([^/]+)\//.exec(m.d || "");
-    if (vgm) {
-      try {
-        clusterid = (await this.resolvePool(vgm[1])).clusterid;
-      } catch (e) {
-        /* pool not resolvable (already gone / not cached) -- unbind without clusterid */
-      }
-    }
+    // unbind needs the SAME clusterid the bind used -- they are all cluster resources, so an
+    // unbind with a mismatched/absent clusterid is a no-op and delete mapping then EBUSYs.
+    // Get the clusterid straight from the mapping's `c` field
+    const maps = await mayacli.showMapping(vol);
+    const m = maps.find((x) => x.n) || {};        // nvme mapping for the subsystem teardown below
+    const cm = maps.find((x) => x.a) || maps[0];  // the active mapping (any protocol) carries `c`
+    const clusterid = cm && cm.c != null ? cm.c : null;
 
-    // unbind (with the resolved clusterid) -> delete mapping. (idempotent: ignore ENOENT/EINVAL)
+    // unbind (with the mapping's clusterid) -> delete mapping. (idempotent: ignore ENOENT/EINVAL)
     await mayacli.unbindMapping(vol, clusterid);
     await mayacli.deleteMapping(vol);
 
@@ -615,7 +678,10 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
       throw new GrpcError(grpc.status.INVALID_ARGUMENT, "volume_id is required");
     }
     const capacity_bytes = this.capacityFromCall(call);
-    const mayacli = this.getMayacli();
+    // pin the resize to the volume's owner (no pool in the request -> derive from the volume)
+    const probe = this.getMayacli();
+    const server = await this.ownerServer(probe, vol);
+    const mayacli = server ? this.getMayacli([server]) : probe;
     // set volume <vol> size=<n>G — configd dispatches volsize(zvol)/refquota(fs) by type
     await mayacli.setVolumeSize({
       vol,
@@ -640,7 +706,10 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
         "source_volume_id and name are required"
       );
     }
-    const mayacli = this.getMayacli();
+    // the snapshot is created in the SOURCE volume's pool -> pin to the source's owner
+    const probe = this.getMayacli();
+    const server = await this.ownerServer(probe, source_volume_id);
+    const mayacli = server ? this.getMayacli([server]) : probe;
     // CSI snapshot_id is uniform "<source>@<name>"; mayacli id is per-kind (Mayacli.snapName)
     const snapshot_id = `${source_volume_id}@${name}`;
     const { srcKind, sizeBytes } = await mayacli.volSrcInfo(source_volume_id);
@@ -685,10 +754,15 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
     if (!snapshot_id) {
       throw new GrpcError(grpc.status.INVALID_ARGUMENT, "snapshot_id is required");
     }
-    const mayacli = this.getMayacli();
     // source may be gone so we can't query the kind -> try both @-qualified and bare forms
     const at = snapshot_id.lastIndexOf("@");
     const bare = at >= 0 ? snapshot_id.slice(at + 1) : snapshot_id;
+    // the snapshot lives in its SOURCE volume's pool -> pin to the source's owner (best-effort:
+    // if the source is already gone, ownerServer is null and we fall back to the probe).
+    const src = at > 0 ? snapshot_id.slice(0, at) : null;
+    const probe = this.getMayacli();
+    const server = src ? await this.ownerServer(probe, src) : null;
+    const mayacli = server ? this.getMayacli([server]) : probe;
     await mayacli.deleteSnapshot(snapshot_id);
     if (bare !== snapshot_id) await mayacli.deleteSnapshot(bare);
     return {};
@@ -701,46 +775,38 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
   async ListSnapshots(call) {
     const mayacli = this.getMayacli();
     const req = call.request;
-    // re-encode the per-kind mayacli id back to the uniform CSI snapshot_id
-    const toEntry = (s, src) => ({
-      snapshot: {
-        snapshot_id: String(s.l).includes("@") ? s.l : `${src}@${s.l}`,
-        source_volume_id: src,
-        creation_time: { seconds: Number(s.ct) || 0, nanos: 0 },
-        ready_to_use: true,
-        size_bytes: Number(s.c) || 0,
-      },
-    });
+    // ListSnapshots carries NO pool/parameters, so there is no owner to pin to. Read the
+    // cluster VOLDB (`show vol type=4` = V_SNAP), which is peer-synced to EVERY node --
+    // never the per-source backend `show snapshot` (only the owner answers it; off-owner
+    // it returns err=14 -> [], so that pool's snapshots silently vanish from the list).
+    // For zpool the voldb label IS the CSI id "<src>@<name>" (mayascale is always zpool,
+    // so this is exact). vg/thin snapshot labels are bare with no source embedded -- those
+    // would need the per-source path; tracked as a follow-up.
+    const snaps = await mayacli.showSnapshotsAll();
+    const toEntry = (s) => {
+      const at = String(s.l).indexOf("@");
+      const src = at > 0 ? s.l.slice(0, at) : s.l;
+      return {
+        snapshot: {
+          snapshot_id: s.l,
+          source_volume_id: src,
+          creation_time: { seconds: Number(s.ct) || 0, nanos: 0 },
+          ready_to_use: true,
+          size_bytes: Number(s.c) || 0,
+        },
+      };
+    };
 
-    let entries = [];
+    let entries;
     if (req.snapshot_id) {
-      const at = req.snapshot_id.lastIndexOf("@");
-      if (at > 0) {
-        const src = req.snapshot_id.slice(0, at);
-        const bare = req.snapshot_id.slice(at + 1);
-        const sin = await mayacli.showSnapshots(src);
-        entries = sin
-          .filter((s) => s.l === req.snapshot_id || s.l === bare)
-          .map((s) => toEntry(s, src));
-      }
+      entries = snaps.filter((s) => s.l === req.snapshot_id).map(toEntry);
     } else if (req.source_volume_id) {
-      const sin = await mayacli.showSnapshots(req.source_volume_id);
-      entries = sin.map((s) => toEntry(s, req.source_volume_id));
+      const pref = req.source_volume_id + "@";
+      entries = snaps.filter((s) => String(s.l).startsWith(pref)).map(toEntry);
     } else {
-      const vols = await mayacli.showVolumes();
-      const types = this.driverVolTypes();
-      for (const v of vols) {
-        // only this driver's real user volumes (hide __* pseudo entities)
-        if (!types.includes(v.t) || String(v.l).startsWith("__")) continue;
-        // a volume that can't be listed right now (gone mid-enum) must not fail the whole list
-        let sin;
-        try {
-          sin = await mayacli.showSnapshots(v.l);
-        } catch (e) {
-          continue;
-        }
-        for (const s of sin) entries.push(toEntry(s, v.l));
-      }
+      entries = snaps
+        .filter((s) => !String(s.l).startsWith("__"))
+        .map(toEntry);
     }
     return this._paginate(entries, req);
   }
@@ -758,22 +824,25 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
       return { available_capacity: 0 };
     }
     const mayacli = this.getMayacli();
-    // kind-appropriate pool-free query: zpool root `cle`, or vg free
-    const { kind } = await this.resolvePool(pool, mayacli);
+    // pool free space is a BACKEND read -- only the pool's OWNER has it. resolvePool
+    // already returns the owner VIP; query there, NOT the default/first VIP (which
+    // lacks the pool and would report 0). GetCapacity has the pool in parameters.
+    const { kind, server } = await this.resolvePool(pool, mayacli);
+    const ownerCli = server ? this.getMayacli([server]) : mayacli;
     if (kind === "zpool") {
-      const zp = await mayacli.showZpool(pool);
+      const zp = await ownerCli.showZpool(pool);
       const root =
         zp && Array.isArray(zp.zv) ? zp.zv.find((d) => d.n === pool) : null;
       return { available_capacity: root ? Number(root.cle) : 0 };
     }
     // vg (LVM / md raidgroup)
-    const free = await mayacli.vgFree(pool);
+    const free = await ownerCli.vgFree(pool);
     return { available_capacity: Number(free) || 0 };
   }
 
   /** Provisioned capacity (bytes) of an existing volume from show-vol `c`; 0 if absent. */
   async existingCapacity(vol, mayacli) {
-    const v = (await mayacli.showVolumes()).find((x) => x.l === vol);
+    const v = await mayacli.showVolume(vol); // targeted lookup, not a full-dump scan
     // `c` == vol_size (refquota for fs / volsize for block)
     return v ? Number(v.c) || 0 : 0;
   }
@@ -805,7 +874,9 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
       throw new GrpcError(grpc.status.INVALID_ARGUMENT, "volume_id is required");
     }
     const mayacli = this.getMayacli();
-    const v = (await mayacli.showVolumes()).find((x) => x.l === vol);
+    // targeted single-volume lookup (voldb, peer-synced -> the default node answers) --
+    // not a full `show vol` dump + scan.
+    const v = await mayacli.showVolume(vol);
     if (!v) {
       throw new GrpcError(grpc.status.NOT_FOUND, `volume ${vol} not found`);
     }

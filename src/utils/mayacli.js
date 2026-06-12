@@ -282,8 +282,9 @@ class Mayacli {
     }
     let kind;
     if (z.t === VOL_TYPE.ZPOOL) kind = "zpool";
+    else if (z.t === VOL_TYPE.THINPOOL) kind = "thinpool"; // thin LV: container=thinpool=<pool>
     else if (z.t === VOL_TYPE.VG || z.t === VOL_TYPE.RG) kind = "vg";
-    else kind = "zpool"; // default; explicit pools[].kind in config overrides
+    else throw new Error(`pool '${pool}' has unsupported vol_type ${z.t} (expected zpool/vg/thinpool)`);
     return { clusterid: Number(z.cid), kind };
   }
 
@@ -302,6 +303,25 @@ class Mayacli {
     if (v.st === VOL_TYPE.VG || v.st === VOL_TYPE.RG) srcKind = "vg";
     else if (v.st === VOL_TYPE.THINPOOL) srcKind = "thinpool"; // thin LV: bare names, sizeless snap, native clone
     return { srcKind, sizeBytes: Number(v.c) || 0 };
+  }
+
+  /**
+   * A single volume's full voldb record via `-j show volume <label>` (TARGETED -- avoids
+   * dumping all of `show vol` and scanning). Returns the volfullinfo record
+   * {l, c (size), d (dev/share), cid, ct, st, sl, ...} or null if absent (ENOENT). The
+   * voldb is peer-synced, so any node answers.
+   */
+  async showVolume(label) {
+    const r = await this.exec(["-j", "show", "volume", label]);
+    if (r.code !== 0) {
+      if (r.code === ERRNO.ENOENT) return null; // not found -> null (no scan, no throw)
+      const e = new Error(
+        `mayacli -j show volume ${label} failed (rc=${r.code}): ${(r.stderr || r.stdout).trim()}`
+      );
+      e.code = r.code;
+      throw e;
+    }
+    return (this.parseJ(r.stdout).volfullinfo || []).find((x) => x.l === label) || null;
   }
 
   /** Failover map {mapid(==clusterid): virtip(==data VIP)} from `-j show failover`. */
@@ -347,6 +367,26 @@ class Mayacli {
     }
     const info = (this.parseJ(r.stdout).snapvolinfo || [])[0];
     return info && Array.isArray(info.sin) ? info.sin : [];
+  }
+
+  /**
+   * All snapshots cluster-wide via `-j show vol type=4` (V_SNAP entries). This reads the
+   * VOLDB, peer-synced to EVERY node -> ANY node answers, even one without the pool's backend
+   * -- unlike `show snapshot [<vol>]`, which does a per-source BACKEND GET that err=14s
+   * off-owner (so it can't serve a context-free, owner-agnostic list). The basic record now
+   * carries `ct` (create time). Each entry: {t:4, l (= "<src>@<name>" for zpool), d, c (size),
+   * ct, cid}. Used by ListSnapshots, which has no pool context to pin to.
+   */
+  async showSnapshotsAll() {
+    const r = await this.exec(["-j", "show", "vol", "type=4"]);
+    if (r.code !== 0) {
+      const e = new Error(
+        `mayacli -j show vol type=4 failed (rc=${r.code}): ${(r.stderr || r.stdout).trim()}`
+      );
+      e.code = r.code;
+      throw e;
+    }
+    return this.parseJ(r.stdout).vols || [];
   }
 
   /** Pool detail via `-j show zpool <pool>` -> the record with `zv:[{n,size,cle}]`; `cle`=available. */
