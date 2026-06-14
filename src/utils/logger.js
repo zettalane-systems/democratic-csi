@@ -1,4 +1,5 @@
 const os = require("os");
+const pkg = require("../../package.json");
 
 /**
  * Levels
@@ -29,7 +30,7 @@ let formatters;
 let defaultMeta;
 if (env == "production") {
   formatters = [winston.format.json()];
-  defaultMeta = { service: "democratic-csi", host: os.hostname() };
+  defaultMeta = { service: pkg.name, host: os.hostname() };
 } else {
   formatters = [winston.format.colorize(), winston.format.simple()];
   defaultMeta = {};
