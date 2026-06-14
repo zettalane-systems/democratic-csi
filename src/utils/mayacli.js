@@ -541,6 +541,11 @@ class Mayacli {
   }
 
   // ---- snapshots -------------------------------------------------------------
+  // LVM rejects LV names starting "snapshot"/"pvmove" -> prefix to a legal name.
+  static lvSafeName(name) {
+    return /^(snapshot|pvmove)/.test(name) ? `csi-${name}` : name;
+  }
+
   /**
    * The mayacli snapshot id by backend (analogue of configd's snapname()):
    * zfs -> "<sourceVol>@<name>", vg/thinpool -> bare "<name>".

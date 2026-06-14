@@ -723,14 +723,19 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
     const server = await this.ownerServer(probe, source_volume_id);
     const mayacli = server ? this.getMayacli([server]) : probe;
     const { srcKind, sizeBytes } = await mayacli.volSrcInfo(source_volume_id);
-    // snapshot_id IS the configd label (snapName)
-    const mayaSnap = Mayacli.snapName(srcKind, source_volume_id, name);
+    // snapshot_id IS the configd label (lvSafeName keeps it LVM-legal)
+    const mayaSnap = Mayacli.lvSafeName(
+      Mayacli.snapName(srcKind, source_volume_id, name)
+    );
     const snapshot_id = mayaSnap;
     let sin = await mayacli.showSnapshots(source_volume_id);
     let s = sin.find((x) => x.l === mayaSnap);
     if (!s) {
       // not on this source -> create (snapshot_id unique by construction; re-create idempotent)
-      const opts = { name, vol: source_volume_id };
+      const opts = {
+        name: srcKind === "vg" || srcKind === "thinpool" ? mayaSnap : name,
+        vol: source_volume_id,
+      };
       if (srcKind === "vg") {
         // a thick LVM snapshot needs a CoW area; default 25% of the source size
         const cowMiB = Math.max(1, Math.ceil((sizeBytes * 25) / 100 / (1024 * 1024)));
