@@ -369,6 +369,14 @@ class Mayacli {
     return info && Array.isArray(info.sin) ? info.sin : [];
   }
 
+  /** A volume's origin (snapvolinfo.origin from `-j show snapshot`), or null. Never throws. */
+  async cloneOrigin(vol) {
+    const r = await this.exec(["-j", "show", "snapshot", vol]);
+    if (r.code !== 0) return null; // no origin
+    const info = (this.parseJ(r.stdout).snapvolinfo || [])[0];
+    return info && info.origin ? info.origin : null;
+  }
+
   /**
    * All snapshots cluster-wide via `-j show vol type=4` (V_SNAP entries). This reads the
    * VOLDB, peer-synced to EVERY node -> ANY node answers, even one without the pool's backend

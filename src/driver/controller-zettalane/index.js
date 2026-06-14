@@ -263,6 +263,8 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
       const kind = POOL_KIND[v.t];
       if (!kind) continue; // not a pool
       const clusterid = Number(v.cid);
+      // HA: cid=0 is a peer-sync phantom (no VIP) -> skip. standalone: cid=0 is valid.
+      if (!clusterid && eps.length > 1) continue;
       // VIP from the authoritative failover map; single-endpoint fallback only when no HA
       const vip =
         (fo.byMapid && fo.byMapid[String(clusterid)]) ||
@@ -489,17 +491,14 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
         );
       }
       if (content_source && content_source.snapshot) {
-        // clone from snapshot: form the per-kind mayacli snap id; configd creates the target
+        // clone from snapshot: snapshot_id IS the configd label -> clone it directly
         const sid = content_source.snapshot.snapshot_id;
-        const at = sid.lastIndexOf("@");
-        const srcVol = at >= 0 ? sid.slice(0, at) : sid;
-        const snap = at >= 0 ? sid.slice(at + 1) : sid;
-        const { srcKind } = await mayacli.volSrcInfo(srcVol);
+        const { srcKind } = await mayacli.volSrcInfo(sid);
         // vg clone target is filled by async dd -> defer export to node-stage
         if (srcKind === "vg") deferExport = true;
         await mayacli.createVolumeFromSnapshot({
           label,
-          snapshotof: Mayacli.snapName(srcKind, srcVol, snap),
+          snapshotof: sid,
           vol: srcKind === "vg" ? undefined : vol,
           sizeG: srcKind === "vg" ? undefined : Math.ceil(capacity_bytes / 1024 ** 3),
         });
@@ -642,6 +641,10 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
     const server = await this.ownerServer(probe, vol);
     const mayacli = server ? this.getMayacli([server]) : probe;
 
+    // eager: for now queries for origin every delete
+    // can be made to query on special error case
+    const cloneOrigin = await mayacli.cloneOrigin(vol);
+
     // unbind needs the SAME clusterid the bind used -- they are all cluster resources, so an
     // unbind with a mismatched/absent clusterid is a no-op and delete mapping then EBUSYs.
     // Get the clusterid straight from the mapping's `c` field
@@ -668,6 +671,15 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
     }
 
     await mayacli.deleteVolume(vol);
+
+    // reap the intermediate clonesnap (clonesnap- prefix only, never a user snapshot)
+    if (cloneOrigin) {
+      const snapBase = cloneOrigin.slice(cloneOrigin.lastIndexOf("@") + 1);
+      if (snapBase.startsWith("clonesnap-")) {
+        await mayacli.deleteSnapshot(cloneOrigin);
+      }
+    }
+
     await mayacli.save();
     return {};
   }
@@ -710,10 +722,10 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
     const probe = this.getMayacli();
     const server = await this.ownerServer(probe, source_volume_id);
     const mayacli = server ? this.getMayacli([server]) : probe;
-    // CSI snapshot_id is uniform "<source>@<name>"; mayacli id is per-kind (Mayacli.snapName)
-    const snapshot_id = `${source_volume_id}@${name}`;
     const { srcKind, sizeBytes } = await mayacli.volSrcInfo(source_volume_id);
+    // snapshot_id IS the configd label (snapName)
     const mayaSnap = Mayacli.snapName(srcKind, source_volume_id, name);
+    const snapshot_id = mayaSnap;
     let sin = await mayacli.showSnapshots(source_volume_id);
     let s = sin.find((x) => x.l === mayaSnap);
     if (!s) {
@@ -754,17 +766,11 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
     if (!snapshot_id) {
       throw new GrpcError(grpc.status.INVALID_ARGUMENT, "snapshot_id is required");
     }
-    // source may be gone so we can't query the kind -> try both @-qualified and bare forms
-    const at = snapshot_id.lastIndexOf("@");
-    const bare = at >= 0 ? snapshot_id.slice(at + 1) : snapshot_id;
-    // the snapshot lives in its SOURCE volume's pool -> pin to the source's owner (best-effort:
-    // if the source is already gone, ownerServer is null and we fall back to the probe).
-    const src = at > 0 ? snapshot_id.slice(0, at) : null;
+    // snapshot_id IS the configd label -> delete directly; pin to its owner (probe if gone)
     const probe = this.getMayacli();
-    const server = src ? await this.ownerServer(probe, src) : null;
+    const server = await this.ownerServer(probe, snapshot_id);
     const mayacli = server ? this.getMayacli([server]) : probe;
     await mayacli.deleteSnapshot(snapshot_id);
-    if (bare !== snapshot_id) await mayacli.deleteSnapshot(bare);
     return {};
   }
 
@@ -772,41 +778,42 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
    * ListSnapshots: snapshot_id (one) / source_volume_id (per-volume) / neither
    * (global enumerate). No pagination (all entries returned).
    */
-  async ListSnapshots(call) {
-    const mayacli = this.getMayacli();
-    const req = call.request;
-    // ListSnapshots carries NO pool/parameters, so there is no owner to pin to. Read the
-    // cluster VOLDB (`show vol type=4` = V_SNAP), which is peer-synced to EVERY node --
-    // never the per-source backend `show snapshot` (only the owner answers it; off-owner
-    // it returns err=14 -> [], so that pool's snapshots silently vanish from the list).
-    // For zpool the voldb label IS the CSI id "<src>@<name>" (mayascale is always zpool,
-    // so this is exact). vg/thin snapshot labels are bare with no source embedded -- those
-    // would need the per-source path; tracked as a follow-up.
-    const snaps = await mayacli.showSnapshotsAll();
-    const toEntry = (s) => {
-      const at = String(s.l).indexOf("@");
-      const src = at > 0 ? s.l.slice(0, at) : s.l;
-      return {
-        snapshot: {
-          snapshot_id: s.l,
-          source_volume_id: src,
-          creation_time: { seconds: Number(s.ct) || 0, nanos: 0 },
-          ready_to_use: true,
-          size_bytes: Number(s.c) || 0,
-        },
-      };
+  // V_SNAP record -> CSI snapshot entry; snapshot_id IS the configd label (rec.l)
+  _snapEntry(rec, src) {
+    const label = String(rec.l);
+    const at = label.indexOf("@");
+    const source = src || rec.sl || (at > 0 ? label.slice(0, at) : label);
+    return {
+      snapshot: {
+        snapshot_id: label,
+        source_volume_id: source,
+        creation_time: { seconds: Number(rec.ct) || 0, nanos: 0 },
+        ready_to_use: true,
+        size_bytes: Number(rec.c) || 0,
+      },
     };
+  }
 
+  async ListSnapshots(call) {
+    const req = call.request;
+    const probe = this.getMayacli();
     let entries;
     if (req.snapshot_id) {
-      entries = snaps.filter((s) => s.l === req.snapshot_id).map(toEntry);
+      // snapshot_id IS the configd label -> one voldb lookup
+      const rec = await probe.showVolume(req.snapshot_id);
+      entries = rec ? [this._snapEntry(rec)] : [];
     } else if (req.source_volume_id) {
-      const pref = req.source_volume_id + "@";
-      entries = snaps.filter((s) => String(s.l).startsWith(pref)).map(toEntry);
+      // per-source GET -> pin to the source's owner
+      const src = req.source_volume_id;
+      const server = await this.ownerServer(probe, src);
+      const cli = server ? this.getMayacli([server]) : probe;
+      entries = (await cli.showSnapshots(src)).map((s) => this._snapEntry(s, src));
     } else {
+      // global -> peer-synced voldb dump; vg source is best-effort (bare)
+      const snaps = await probe.showSnapshotsAll();
       entries = snaps
         .filter((s) => !String(s.l).startsWith("__"))
-        .map(toEntry);
+        .map((s) => this._snapEntry(s));
     }
     return this._paginate(entries, req);
   }
