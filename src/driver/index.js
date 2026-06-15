@@ -850,6 +850,18 @@ class CsiBaseDriver {
           case "nfs":
           case "lustre":
             device = `${volume_context.server}:${volume_context.share}`;
+            // NFSv3 client + v4-pseudoroot export: v3 has no pseudoroot, so mount
+            // the real path = fsid=0 root + share. nfs_pseudoroot is set by the
+            // controller only for pseudoroot exports (not standalone pure-v3).
+            if (
+              node_attach_driver === "nfs" &&
+              volume_context.nfs_pseudoroot &&
+              mount_flags.some((f) =>
+                /(?:^|,)(?:nfs)?vers=3(?![0-9])/.test(String(f).replace(/\s/g, ""))
+              )
+            ) {
+              device = `${volume_context.server}:${volume_context.nfs_pseudoroot.replace(/\/+$/, "")}${volume_context.share}`;
+            }
             break;
           case "smb":
             device = `//${volume_context.server}/${volume_context.share}`;

@@ -441,6 +441,17 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
     const { clusterid, server, kind } = await this.resolvePool(pool);
     const mayacli = this.getMayacli([server]);
     const recordsize = _.get(call, "request.parameters.recordsize", "128K");
+    // backend filesystem for LVM file pools (vg/thinpool NFS/SMB): xfs (default) | ext4.
+    // ignored for zpool (always zfs) and for block volumes.
+    const backendFs = String(
+      _.get(call, "request.parameters.filesystem", "xfs")
+    ).toLowerCase();
+    if (!["xfs", "ext4"].includes(backendFs)) {
+      throw new GrpcError(
+        grpc.status.INVALID_ARGUMENT,
+        `parameters.filesystem '${backendFs}' unsupported (xfs|ext4)`
+      );
+    }
     // thick by default; thin is opt-in (zfs drops refreservation, LVM uses a thin pool)
     const thinRaw = _.get(call, "request.parameters.thin"); // undefined if not specified
     const thin = String(thinRaw ?? "").toLowerCase() === "true";
@@ -463,7 +474,6 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
 
     // mayacli label: a zpool prefixes <pool>-<label>; a VG uses the bare label.
     const vol = kind === "zpool" ? `${pool}-${label}` : label;
-    const share = `/${pool}/${label}`;
     const content_source = call.request.volume_content_source;
 
     // exact-fit idempotency: pvcname + capacity + active export must match (partial-failure self-heal)
@@ -526,6 +536,7 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
           access: pp.access,
           sizeBytes: capacity_bytes,
           recordsize,
+          fs: backendFs,
           thin,
           clusterid,
         });
@@ -587,7 +598,27 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
     // volume_context per access type
     let volume_context;
     if (pp.access === "filesystem") {
+      // share is configd-authoritative -- read it from the bound mapping (m_share):
+      // nfs => mountpoint path, smb => share name (volname). Fall back to the
+      // volume mountpoint (showVolume.d), then /<pool>/<label>, for pre-m_share configd.
+      // m_share is the uniform, protocol-correct source (nfs => path, smb => name).
+      // No per-protocol branch: read it straight from the bound mapping.
+      const m = (await mayacli.showMapping(vol)).find((x) => x.a) || {};
+      let share = m.sh;
+      if (!share) {
+        // transition only: pre-m_share configd has no share field -> volume
+        // mountpoint (nfs-correct; smb requires the m_share-capable configd).
+        const v = await mayacli.showVolume(vol);
+        share = v && v.d ? v.d : `/${pool}/${label}`;
+      }
       volume_context = { node_attach_driver: pp.attach, server, share };
+      // NFS export model from the mapping version (m.h): 255=all / 4=v4 -> v4
+      // pseudoroot (share is fsid=0-relative); 3 -> standalone pure-v3 export.
+      // A v3 CLIENT on a pseudoroot export must prepend the fsid=0 root; the node
+      // decides per the requested nfsvers. Standalone (h==3) needs no prefix.
+      if (pp.attach === "nfs" && m.h !== undefined && m.h !== 3) {
+        volume_context.nfs_pseudoroot = "/export"; // configd fsid=0 root
+      }
     } else {
       // nvme-of: nqn + nsid from the bound mapping; listener port = the per-PVC portal's port
       const m = (await mayacli.showMapping(vol)).find((x) => x.n) || {};

@@ -140,7 +140,7 @@ class Mayacli {
    * Provision a volume: result type follows access (filesystem -> V_FILESYS,
    * block -> V_FLEX), container keyword follows kind. Thick unless a.thin.
    * @param {object} a {label, container:{kind,name}, access, sizeBytes,
-   *                     recordsize?, thin?, thinpool?, clusterid?}
+   *                     recordsize?, fs?(xfs|ext4, LVM filesys), thin?, thinpool?, clusterid?}
    */
   async createVolume(a) {
     const { kind, name } = a.container;
@@ -158,8 +158,8 @@ class Mayacli {
         if (a.clusterid != null) args.push(`clusterid=${a.clusterid}`);
         if (opts.length) args.push(Mayacli.opt(`"${opts.join(" ")}"`));
       } else {
-        // XFS on an LVM LV (the LV is V_FLEX under a V_FILESYS xfs)
-        args.push("filesys=xfs", a.thin && a.thinpool ? `thinpool=${a.thinpool}` : container);
+        // xfs (default) or ext4 on an LVM LV (the LV is V_FLEX under a V_FILESYS)
+        args.push(`filesys=${a.fs || "xfs"}`, a.thin && a.thinpool ? `thinpool=${a.thinpool}` : container);
         if (a.sizeBytes) args.push(`size=${a.sizeBytes}`);
         if (a.clusterid != null) args.push(`clusterid=${a.clusterid}`);
       }
