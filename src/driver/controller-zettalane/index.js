@@ -411,7 +411,10 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
   /** protocol -> {access, mapping controller, node_attach_driver}. nfs/nvme-of ready. */
   static PROTO = {
     nfs: { access: "filesystem", controller: "nfs", attach: "nfs", ready: true },
-    smb: { access: "filesystem", controller: "smb", attach: "smb", ready: false },
+    // smb: profile via parameters.smbProfile (default posix). Node mounts
+    // //server/<volname> with cifs creds from the node-stage secret (mount_flags
+    // username=,password=). share = m_share (= volname). See §SMB in CSI_DRIVER_DESIGN.
+    smb: { access: "filesystem", controller: "smb", attach: "smb", ready: true },
     iscsi: { access: "block", controller: "iscsi", attach: "iscsi", ready: false },
     "nvme-of": { access: "block", controller: "nvmet-tcp", attach: "nvmeof", ready: true },
     nvmeof: { access: "block", controller: "nvmet-tcp", attach: "nvmeof", ready: true },
@@ -572,8 +575,26 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
               extra: [`nodename=${nqn}`, "lun=1", `targetid=${portal.tag}`],
             });
           }
+        } else if (!maps.length && protocol === "smb") {
+          // smb share: posix profile (no AD -- share dir 2775 root:samba-users,
+          // the auto sambadmin is in samba-users) + read_only=No (Samba defaults
+          // shares read-only). Node mounts cifs as sambadmin (creds from the
+          // node-stage secret mount_flags). windows profile needs AD SIDs+chown.
+          const profile = _.get(call, "request.parameters.smbProfile", "posix");
+          const smbOpts = _.get(
+            call,
+            "request.parameters.smbOptions",
+            "browseable=Yes;read_only=No"
+          );
+          await mayacli.createMapping({
+            vol,
+            controller: pp.controller, // smb
+            clusterid,
+            extra: [`profile=${profile}`],
+            options: smbOpts,
+          });
         } else if (!maps.length) {
-          // filesystem shares carry NFS export options.
+          // nfs share: NFS export options.
           await mayacli.createMapping({
             vol,
             controller: pp.controller,
