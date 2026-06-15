@@ -596,7 +596,9 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
       const port = sub && sub.portalPort ? sub.portalPort : 4420;
       volume_context = {
         node_attach_driver: "nvmeof",
-        transport: "tcp",
+        // transports carries proto+host+port; a bare transport:"tcp" only adds a
+        // phantom connection -> node sees >1 path, breaks on kernels w/o native
+        // nvme multipath (e.g. AL2023/EKS) via the DM-multipath branch.
         transports: `tcp://${server}:${port}`,
         nqn,
         nsid: String(m.l != null ? m.l : 1),
