@@ -505,16 +505,25 @@ class Mayacli {
    * Per-PVC portal via `portalgroup=auto` (configd allocates tag+port); diff portals
    * before/after to recover the new {tag,port}. (Concurrent PVCs need an echo'd tag — TODO.)
    */
-  async createPortalAuto(vip) {
-    const before = new Set(
-      (await this.showPortals()).filter((p) => p.ip === vip).map((p) => p.tag)
+  async createPortalAuto(vip, cookie) {
+    return this._portalAutoByCookie("nvmet", "__nvmeportal_group", vip, cookie, () =>
+      this.showPortals()
     );
-    await this.execOk(["create", "nvmet", "portalgroup=auto", `portal=${vip}`]);
-    const fresh = (await this.showPortals()).filter((p) => p.ip === vip && !before.has(p.tag));
-    if (!fresh.length) {
-      throw new Error(`createPortalAuto: no new portal read back on ${vip}`);
+  }
+
+  /** Shared portalgroup=auto + cookie-readback for iscsi/nvmet. Stamps the cookie in
+   * the portal description on create; finds the portal by description==cookie (the
+   * tag is the volume label's suffix __<prefix>.<tag>). Race-free under concurrency.
+   * @param {string} kind 'iscsi'|'nvmet'  @param {string} prefix portal label prefix
+   * @param {function} listFn -> [{tag, ip, port}] for this kind. */
+  async _portalAutoByCookie(kind, prefix, vip, cookie, listFn) {
+    if (!cookie) throw new Error(`_portalAutoByCookie: cookie required (${kind} ${vip})`);
+    await this.execOk(["create", kind, "portalgroup=auto", `portal=${vip}`, `description=${cookie}`]);
+    for (const p of (await listFn()).filter((x) => x.ip === vip)) {
+      const v = await this.showVolume(`${prefix}.${p.tag}`);
+      if (v && v.dn === cookie) return p; // {tag, ip, port}
     }
-    return fresh.sort((a, b) => b.tag - a.tag)[0]; // newest
+    throw new Error(`${kind} portalgroup=auto: no portal with cookie ${cookie} on ${vip}`);
   }
 
   /** Create the per-PVC subsystem (full NQN) on a portal group tag. Idempotent: an existing
@@ -570,18 +579,16 @@ class Mayacli {
     });
   }
 
-  /** Per-PVC iSCSI portal via `portalgroup=auto` (configd picks the TPGT; port fixed
-   * :3260); diff portals before/after to recover the new {tag,port}. */
-  async createIscsiPortalAuto(vip) {
-    const before = new Set(
-      (await this.showIscsiPortals()).filter((p) => p.ip === vip).map((p) => p.tag)
+  /** Per-PVC iSCSI portal via `portalgroup=auto` (configd picks the TPGT, port fixed
+   * :3260). Stamp a unique COOKIE in the portal's description on create, then read
+   * back the portal whose description == cookie -- NOT a before/after diff. Under
+   * concurrent CreateVolumes the diff is ambiguous (each worker sees the others'
+   * fresh portals and could pick the same tag -> duplicate targetid -> bind EBUSY).
+   * The cookie identifies THIS worker's portal exactly. Returns {tag, ip, port}. */
+  async createIscsiPortalAuto(vip, cookie) {
+    return this._portalAutoByCookie("iscsi", "__portal_group", vip, cookie, () =>
+      this.showIscsiPortals()
     );
-    await this.execOk(["create", "iscsi", "portalgroup=auto", `portal=${vip}`]);
-    const fresh = (await this.showIscsiPortals()).filter((p) => p.ip === vip && !before.has(p.tag));
-    if (!fresh.length) {
-      throw new Error(`createIscsiPortalAuto: no new portal read back on ${vip}`);
-    }
-    return fresh.sort((a, b) => b.tag - a.tag)[0]; // newest
   }
 
   /** Create the per-PVC target (full IQN) on a portal group tag. Idempotent. */

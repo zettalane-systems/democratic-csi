@@ -578,7 +578,7 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
           const portal =
             have && have.portalTag != null
               ? { tag: have.portalTag }
-              : await mayacli.createIscsiPortalAuto(server);
+              : await mayacli.createIscsiPortalAuto(server, iqn);
           if (!have) await mayacli.createIscsiTarget(iqn, portal.tag);
           const peer = this.endpoints().find((e) => e !== server);
           if (peer) {
@@ -602,7 +602,7 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
           const portal =
             have && have.portalTag != null
               ? { tag: have.portalTag, port: have.portalPort }
-              : await mayacli.createPortalAuto(server);
+              : await mayacli.createPortalAuto(server, nqn);
           if (!have) await mayacli.createSubsystem(nqn, portal.tag);
           const peer = this.endpoints().find((e) => e !== server);
           if (peer) {
