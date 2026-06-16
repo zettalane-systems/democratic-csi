@@ -64,26 +64,26 @@ COPY --from=build /usr/local/lib/nodejs/bin/node /usr/local/bin/node
 # which we never emit). After install, strip the dnf history + cache (microdnf clean
 # all leaves /var/lib/dnf/history.* + the WAL).
 #
-# iscsi-initiator-utils is installed in its OWN microdnf call. In ONE combined
-# transaction with the rest, its %post `systemctl` hits "Failed to connect to bus" and
-# fails the build; split into a separate call it runs `systemctl preset` offline cleanly
-# (exit 0). microdnf has no --noscripts / tsflags=noscripts, so the split IS the fix --
-# no scriptlet-skip or error-swallow needed.
+# Block protocols (iscsi + nvme-of) carry NO client tooling or identity in the image:
+# the node plugin bridges to the HOST via wrapper scripts (docker/iscsiadm, docker/nvme),
+# so iscsiadm/nvme run on the host with the node's real identity (initiatorname.iscsi /
+# /etc/nvme/hostnqn). Hence neither iscsi-initiator-utils nor nvme-cli is installed --
+# which also sidesteps iscsi-initiator-utils's %post `systemctl` failing the build.
 RUN microdnf install -y --setopt=install_weak_deps=0 --setopt=tsflags=nodocs \
       glibc-minimal-langpack \
-      nfs-utils nvme-cli \
+      nfs-utils \
       xfsprogs e2fsprogs util-linux gdisk cloud-utils-growpart \
       cifs-utils socat rsync procps-ng \
       libuuid openssl-libs libtirpc krb5-libs zlib \
-  && microdnf install -y --setopt=install_weak_deps=0 --setopt=tsflags=nodocs \
-      iscsi-initiator-utils \
   && microdnf clean all \
   && rm -rf /var/lib/dnf/history.* /var/cache/dnf /var/log/dnf* /var/log/hawkey.log
 
-# nvme host identity — required for `nvme connect` on the node plugin
-RUN mkdir -p /etc/nvme \
-  && echo '83e7a026-2564-455b-ada6-ddbdaf0bc519' > /etc/nvme/hostid \
-  && echo 'nqn.2014-08.org.nvmexpress:uuid:941e4f03-2cd6-435e-86df-731b1c573d86' > /etc/nvme/hostnqn
+# host-command wrappers -> run the host's iscsiadm / nvme (chroot /host by default;
+# nsenter alternative for immutable distros). Host node must have open-iscsi+iscsid
+# (iscsi) and nvme-cli (nvme-of) installed; both supply the per-node client identity.
+ADD docker/iscsiadm /usr/local/sbin/iscsiadm
+ADD docker/nvme     /usr/local/sbin/nvme
+RUN chmod +x /usr/local/sbin/iscsiadm /usr/local/sbin/nvme
 
 # bundle mayacli (controller calls it; talks RPC to remote configd).
 # build-staging.sh stages the binary at vendor/mayacli. On el9 this is a native

@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+
+# Run the host's nvme-cli (mirrors docker/iscsiadm): the node plugin holds no nvme
+# tooling or identity -- it bridges to the host so `nvme connect` uses the node's
+# real /etc/nvme/hostnqn + hostid (per-node unique). chroot is the default; nsenter
+# (into PID 1, since nvme has no daemon to anchor on) suits immutable distros.
+
+: "${NVME_HOST_STRATEGY:=chroot}"
+: "${NVME_HOST_PATH:=nvme}"
+
+echoerr() { printf "%s\n" "$*" >&2; }
+
+P="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/run/current-system/sw/bin"
+
+case ${NVME_HOST_STRATEGY} in
+  chroot)
+    if [[ "${NVME_HOST_PATH}" =~ ^\/ && -f "/host${NVME_HOST_PATH}" ]]; then
+      chroot /host "${NVME_HOST_PATH}" "${@:1}"
+      exit $?
+    fi
+
+    for p in $(echo $P | cut -d ":" -f 1- --output-delimiter=" "); do
+      if [[ -f "/host${p}/nvme" ]]; then
+        chroot /host "${p}/nvme" "${@:1}"
+        exit $?
+      fi
+    done
+
+    chroot /host /usr/bin/env -i PATH="${P}" ${NVME_HOST_PATH} "${@:1}"
+    exit $?
+    ;;
+
+  nsenter)
+    nsenter --mount="/proc/1/ns/mnt" --net="/proc/1/ns/net" -- ${NVME_HOST_PATH} "${@:1}"
+    exit $?
+    ;;
+
+  *)
+    echoerr "invalid NVME_HOST_STRATEGY: ${NVME_HOST_STRATEGY}"
+    exit 1
+    ;;
+esac

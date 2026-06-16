@@ -552,27 +552,11 @@ if (process.env.LOG_GRPC_SESSIONS == "1") {
 if (require.main === module) {
   (async function () {
     try {
-      switch (process.platform) {
-        case "linux":
-          const nvme_dir = "/etc/nvme";
-
-          // ensure directory
-          if (!fs.existsSync(nvme_dir)) {
-            fs.mkdirSync(nvme_dir);
-          }
-
-          //uuidgen > /etc/nvme/hostid
-          if (!fs.existsSync(`${nvme_dir}/hostid`)) {
-            fs.writeFileSync(`${nvme_dir}/hostid`, uuidv4() + "\n");
-          }
-
-          //nvme gen-hostnqn > /etc/nvme/hostnqn
-          if (!fs.existsSync(`${nvme_dir}/hostnqn`)) {
-            const nqn = String(cp.execSync(`nvme gen-hostnqn`));
-            fs.writeFileSync(`${nvme_dir}/hostnqn`, nqn);
-          }
-          break;
-      }
+      // NVMe-oF host identity is NOT created here. The node plugin runs `nvme` via
+      // the docker/nvme wrapper (chroot /host), so connects use the HOST's
+      // /etc/nvme/hostnqn + hostid. The controller never runs nvme. Generating a
+      // container-local hostnqn here is unused, and `nvme gen-hostnqn` (now the
+      // wrapper) would fail in the controller, which has no /host mount.
 
       if (bindAddress) {
         await new Promise((resolve, reject) => {
