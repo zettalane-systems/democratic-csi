@@ -324,20 +324,33 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
   }
 
   /** Validate requested volume_capabilities for this backend. */
-  assertCapabilities(capabilities) {
-    const rt = this.getDriverZfsResourceType();
+  // Multi-protocol: the fs_type allow-list keys on the attach driver (the node path
+  // passes it), not a driver-wide resource type -- block (iscsi/nvmeof) carries an
+  // on-disk fs (ext4/xfs), nfs/smb carry the network fs. When absent (controller-side
+  // ValidateVolumeCapabilities) accept the union; CreateVolume's PROTO map is the real gate.
+  assertCapabilities(capabilities, node_attach_driver) {
+    const BLOCK_FS = ["btrfs", "ext3", "ext4", "ext4dev", "xfs"];
     let message = null;
     const modes = this.getAccessModes();
+    let fsTypes, isFs;
+    switch (node_attach_driver) {
+      case "nfs": fsTypes = ["nfs"]; isFs = true; break;
+      case "smb": fsTypes = ["cifs"]; isFs = true; break;
+      case "lustre": fsTypes = ["lustre"]; isFs = true; break;
+      case "iscsi":
+      case "nvmeof": fsTypes = BLOCK_FS; isFs = false; break;
+      default: fsTypes = ["nfs", "cifs", "lustre", ...BLOCK_FS]; isFs = null;
+    }
     const valid = (capabilities || []).every((capability) => {
-      if (rt === "filesystem" && capability.access_type && capability.access_type != "mount") {
+      // filesystem protocols are mount-only; block may also be raw-block.
+      if (isFs === true && capability.access_type && capability.access_type != "mount") {
         message = `invalid access_type ${capability.access_type}`;
         return false;
       }
       if (
-        rt === "filesystem" &&
         capability.mount &&
         capability.mount.fs_type &&
-        !["nfs", "cifs"].includes(capability.mount.fs_type)
+        !fsTypes.includes(capability.mount.fs_type)
       ) {
         message = `invalid fs_type ${capability.mount.fs_type}`;
         return false;
@@ -415,7 +428,10 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
     // //server/<volname> with cifs creds from the node-stage secret (mount_flags
     // username=,password=). share = m_share (= volname). See §SMB in CSI_DRIVER_DESIGN.
     smb: { access: "filesystem", controller: "smb", attach: "smb", ready: true },
-    iscsi: { access: "block", controller: "iscsi", attach: "iscsi", ready: false },
+    // iscsi: per-PVC target (IQN) + portal (TPGT, fixed :3260), LUN 0. Node logs in
+    // via iscsiadm to <vip>:3260. Userspace maya.iscsid target (nvme-of is the perf
+    // default; iscsi is the compat path).
+    iscsi: { access: "block", controller: "iscsi", attach: "iscsi", ready: true },
     "nvme-of": { access: "block", controller: "nvmet-tcp", attach: "nvmeof", ready: true },
     nvmeof: { access: "block", controller: "nvmet-tcp", attach: "nvmeof", ready: true },
   };
@@ -425,9 +441,12 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
     const protocol = this.getProtocol(call);
     const pp = ControllerZettalaneDriver.PROTO[protocol];
     if (!pp || !pp.ready) {
+      const ready = Object.keys(ControllerZettalaneDriver.PROTO).filter(
+        (k) => ControllerZettalaneDriver.PROTO[k].ready
+      );
       throw new GrpcError(
         grpc.status.UNIMPLEMENTED,
-        `protocol '${protocol}' not implemented yet (nfs, nvme-of)`
+        `protocol '${protocol}' not supported (have: ${ready.join(", ")})`
       );
     }
 
@@ -551,7 +570,32 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
      try {
       const maps = await mayacli.showMapping(vol);
       if (!maps.some((m) => m.a)) {
-        if (pp.access !== "filesystem") {
+        if (pp.attach === "iscsi") {
+          // iscsi: per-PVC target (IQN) + portal (TPGT, fixed :3260), replicated to the
+          // peer (get-or-create). Mirrors nvme-of; LUN 0 (not nsid 1), no per-PVC port.
+          const iqn = Mayacli.csiIqn(vol);
+          const have = (await mayacli.showIscsiTargets()).find((s) => s.iqn === iqn);
+          const portal =
+            have && have.portalTag != null
+              ? { tag: have.portalTag }
+              : await mayacli.createIscsiPortalAuto(server);
+          if (!have) await mayacli.createIscsiTarget(iqn, portal.tag);
+          const peer = this.endpoints().find((e) => e !== server);
+          if (peer) {
+            const peerCli = this.getMayacli([peer]);
+            await peerCli.createIscsiPortal(portal.tag, server);
+            await peerCli.createIscsiTarget(iqn, portal.tag);
+          }
+          if (!maps.length) {
+            await mayacli.createMapping({
+              vol,
+              controller: pp.controller, // iscsi
+              clusterid,
+              // targetid = TPGT; lun=0 (iscsi LUNs start at 0, vs nvme nsid 1)
+              extra: [`nodename=${iqn}`, "lun=0", `targetid=${portal.tag}`],
+            });
+          }
+        } else if (pp.access !== "filesystem") {
           // nvme-of: per-PVC portal + subsystem + namespace, replicated to the peer (get-or-create)
           const nqn = Mayacli.csiNqn(vol);
           const have = (await mayacli.showSubsystems()).find((s) => s.nqn === nqn);
@@ -640,6 +684,16 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
       if (pp.attach === "nfs" && m.h !== undefined && m.h !== 3) {
         volume_context.nfs_pseudoroot = "/export"; // configd fsid=0 root
       }
+    } else if (pp.attach === "iscsi") {
+      // iscsi: iqn + lun from the bound mapping; portal = owner VIP :3260 (the node
+      // iscsiadm-logs-in; VIP failover handles HA, no client multipath needed).
+      const m = (await mayacli.showMapping(vol)).find((x) => x.n) || {};
+      volume_context = {
+        node_attach_driver: "iscsi",
+        portal: `${server}:3260`,
+        iqn: m.n || Mayacli.csiIqn(vol),
+        lun: String(m.l != null ? m.l : 0),
+      };
     } else {
       // nvme-of: nqn + nsid from the bound mapping; listener port = the per-PVC portal's port
       const m = (await mayacli.showMapping(vol)).find((x) => x.n) || {};
@@ -711,16 +765,25 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
     await mayacli.unbindMapping(vol, clusterid);
     await mayacli.deleteMapping(vol);
 
-    // nvme-of: tear down the per-PVC subsystem + portal on every endpoint (HA pair holds both)
+    // block: tear down the per-PVC target + portal on every endpoint (HA pair holds
+    // both). iscsi (iqn.) vs nvme-of (nqn.) use parallel verbs; tag = mapping tid,
+    // fall back to the target parse.
     if (m.n) {
-      // portal tag = mapping tid (captured pre-delete); fall back to the subsystem parse
-      const sub = (await mayacli.showSubsystems()).find((s) => s.nqn === m.n);
+      const isIscsi = m.n.startsWith("iqn.");
+      const sub = isIscsi
+        ? (await mayacli.showIscsiTargets()).find((s) => s.iqn === m.n)
+        : (await mayacli.showSubsystems()).find((s) => s.nqn === m.n);
       const portalTag =
         m.t != null ? m.t : sub && sub.portalTag != null ? sub.portalTag : null;
       for (const ep of this.endpoints()) {
         const cli = this.getMayacli([ep]);
-        await cli.deleteSubsystem(m.n);
-        if (portalTag != null) await cli.deletePortal(portalTag);
+        if (isIscsi) {
+          await cli.deleteIscsiTarget(m.n);
+          if (portalTag != null) await cli.deleteIscsiPortal(portalTag);
+        } else {
+          await cli.deleteSubsystem(m.n);
+          if (portalTag != null) await cli.deletePortal(portalTag);
+        }
       }
     }
 

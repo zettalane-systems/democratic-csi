@@ -168,6 +168,9 @@ class CsiBaseDriver {
     return this.ctx.registry.get(
       `${__REGISTRY_NS__}:default_iscsi_instance`,
       () => {
+        // iscsiadm resolves to the docker/iscsiadm wrapper (/usr/local/sbin),
+        // which runs the host's iscsiadm via chroot /host -- the host owns iscsid
+        // + the iscsi_tcp transport. No package, no in-container daemon.
         return new ISCSI();
       }
     );
@@ -828,7 +831,7 @@ class CsiBaseDriver {
         );
       }
     } else {
-      result = await this.assertCapabilities([capability]);
+      result = await this.assertCapabilities([capability], node_attach_driver);
       if (!result.valid) {
         throw new GrpcError(
           grpc.status.INVALID_ARGUMENT,

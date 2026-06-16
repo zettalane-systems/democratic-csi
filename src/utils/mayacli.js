@@ -540,6 +540,72 @@ class Mayacli {
     return this.execOk(["delete", "nvmet", `portalgroup=${tag}`], { ignoreCodes: [ERRNO.ENOENT] });
   }
 
+  // ---- iscsi portal + per-PVC target (block / iscsi) -------------------------
+  // Mirrors the nvmet helpers above. Difference: the iSCSI portal port is fixed
+  // (:3260), so portalgroup=auto resolves the TPGT only; LUN is 0 (not nsid 1).
+  /** Per-PVC iSCSI target IQN (configd iscsi.c requires iqn./eui.). */
+  static csiIqn(volid) {
+    return `iqn.2026-06.com.zettalane-csi:${volid}`;
+  }
+
+  /** Parse `-j show iscsi portal` -> [{tag, ip, port}] (same shape as nvmet portal). */
+  async showIscsiPortals() {
+    const r = await this.exec(["-j", "show", "iscsi", "portal"]);
+    const out = [];
+    for (const m of (r.stdout || "").matchAll(/\{t:(\d+),p:"([^":]+):(\d+)"\}/g)) {
+      out.push({ tag: Number(m[1]), ip: m[2], port: Number(m[3]) });
+    }
+    return out;
+  }
+
+  /** Targets via `-j show iscsi` -> [{iqn, portalTag, portalPort}]; `ip` encodes
+   * "{<ip>:<port>}<tag>" (recover the portal a target sits on, for teardown). */
+  async showIscsiTargets() {
+    const r = await this.exec(["-j", "show", "iscsi"]);
+    if (r.code !== 0) return [];
+    const targets = this.parseJ(r.stdout).itargets || [];
+    return targets.map((t) => {
+      const m = /\{[^:]+:(\d+)\}(\d+)/.exec(t.ip || "");
+      return { iqn: t.n, portalPort: m ? Number(m[1]) : null, portalTag: m ? Number(m[2]) : null };
+    });
+  }
+
+  /** Per-PVC iSCSI portal via `portalgroup=auto` (configd picks the TPGT; port fixed
+   * :3260); diff portals before/after to recover the new {tag,port}. */
+  async createIscsiPortalAuto(vip) {
+    const before = new Set(
+      (await this.showIscsiPortals()).filter((p) => p.ip === vip).map((p) => p.tag)
+    );
+    await this.execOk(["create", "iscsi", "portalgroup=auto", `portal=${vip}`]);
+    const fresh = (await this.showIscsiPortals()).filter((p) => p.ip === vip && !before.has(p.tag));
+    if (!fresh.length) {
+      throw new Error(`createIscsiPortalAuto: no new portal read back on ${vip}`);
+    }
+    return fresh.sort((a, b) => b.tag - a.tag)[0]; // newest
+  }
+
+  /** Create the per-PVC target (full IQN) on a portal group tag. Idempotent. */
+  async createIscsiTarget(iqn, tag) {
+    return this.execOk(["create", "iscsi", `nodename=${iqn}`, `portalgroup=${tag}`], {
+      ignoreCodes: [ERRNO.EEXIST],
+    });
+  }
+
+  /** Create an iscsi portal with an EXPLICIT tag (peer push; port fixed :3260). */
+  async createIscsiPortal(tag, vip) {
+    return this.execOk(["create", "iscsi", `portalgroup=${tag}`, `portal=${vip}`], {
+      ignoreCodes: [ERRNO.EEXIST],
+    });
+  }
+
+  async deleteIscsiTarget(iqn) {
+    return this.execOk(["delete", "iscsi", `nodename=${iqn}`], { ignoreCodes: [ERRNO.ENOENT] });
+  }
+
+  async deleteIscsiPortal(tag) {
+    return this.execOk(["delete", "iscsi", `portalgroup=${tag}`], { ignoreCodes: [ERRNO.ENOENT] });
+  }
+
   // ---- snapshots -------------------------------------------------------------
   // LVM rejects LV names starting "snapshot"/"pvmove" -> prefix to a legal name.
   static lvSafeName(name) {
