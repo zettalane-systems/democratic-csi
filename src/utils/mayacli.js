@@ -213,6 +213,47 @@ class Mayacli {
     );
   }
 
+  // ---- replication (cold tier). These verbs were absent; the cold-tier CSI
+  // hooks (CreateVolume/CreateSnapshot/DeleteVolume) call them. bind == the
+  // single-shot sync; delete cleans BOTH sides for remote=localhost. See
+  // pg-branch-operator/docs/COLD_TIER_DESIGN.md.
+  async createReplication(vol, remote, o = {}) {
+    return this.execOk([
+      "create", "replication", vol, `remote=${remote}`,
+      `type=${o.type || "snapshot"}`, `controller=${o.controller || "eth0"}`,
+      `syncrate=${o.syncrate || 80}`,
+    ]);
+  }
+  async setReplication(vol, o = {}) {
+    const a = ["set", "replication", vol];
+    if (o.interval != null) a.push(`interval=${o.interval}`);
+    if (o.period != null) a.push(`period=${o.period}`);
+    if (o.keep != null) a.push(`keep=${o.keep}`);
+    return this.execOk(a);
+  }
+  /** bind replication <vol> == the single-shot sync (forks async on the node). */
+  async bindReplication(vol) { return this.execOk(["bind", "replication", vol]); }
+  /** delete replication <vol> -- caller gates on showReplication, so a policy exists. */
+  async deleteReplication(vol) { return this.execOk(["delete", "replication", vol]); }
+  /** True if <vol> has an active replication policy (the "is replicated?" gate).
+   *  remote=localhost has NO separate secondary policy, so the cold twin returns
+   *  false -- always probe the HOT volume. */
+  async showReplication(vol) {
+    const r = await this.exec(["-s", "show", "replication", vol]);
+    const out = r.stdout || "";
+    if (/no replication info|not enabled/i.test(out)) return false;
+    return out.includes("->"); // the policy render line ("<vol> -> localhost:<cold> ...")
+  }
+  /** Wait until `show replication` reports uptodate (after a bind). */
+  async waitReplicationUptodate(vol, { tries = 40, delayMs = 3000 } = {}) {
+    for (let i = 0; i < tries; i++) {
+      const r = await this.exec(["-s", "show", "replication", vol]);
+      if (/uptodate/.test(r.stdout || "")) return true;
+      await new Promise((res) => setTimeout(res, delayMs));
+    }
+    return false;
+  }
+
   // ---- discovery: derive pools->{clusterid,vip} from the cluster ----
   /**
    * Parse mayacli `-j` output (a V()/M() JS-callback program, NOT JSON) by

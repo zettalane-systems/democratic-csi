@@ -246,6 +246,30 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
     return this._poolViewPromise;
   }
 
+  /**
+   * Resolve the cold sink for a hot pool from a StorageClass `coldPool` param:
+   *   'default'/'auto' -> the discovered node-local cold pool (tier pairing);
+   *   a pool name       -> that pool (must be tier=cold);
+   *   absent/empty      -> null (no cold tier).
+   * Returns the pool-view entry {name, clusterid, vip, tier, ...} or null.
+   */
+  async resolveColdPool(hotPoolName, coldParam) {
+    if (!coldParam) return null;
+    const view = await this.buildPoolView();
+    if (coldParam === "default" || coldParam === "auto") {
+      const hot = view.find((p) => p.name === hotPoolName);
+      return (hot && hot.coldPool && view.find((p) => p.name === hot.coldPool)) || null;
+    }
+    const named = view.find((p) => p.name === coldParam);
+    if (named && named.tier !== "cold") {
+      throw new GrpcError(
+        grpc.status.INVALID_ARGUMENT,
+        `coldPool '${coldParam}' is not a cold-tier pool`
+      );
+    }
+    return named || null;
+  }
+
   async _discoverPools() {
     // only true provisioning pools (zpool/vg/thinpool); NOT V_RG (md backing, never a
     // CSI target) -- see CSI_DRIVER_DESIGN.md
@@ -277,6 +301,28 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
       }
       pools.push({ name: v.l, clusterid, vip, kind, source: "discovered" });
     }
+    // Tier classification (cold-tier only; harmless when unused). A COLD pool is
+    // object/S3-backed AND has no special vdev: from `-j show zpool`, its vdev
+    // disks are files (`ma == -1`, i.e. /mnt/<bucket>/file, not a block major) and
+    // `sdc == 0` (special-disk-count). An s3 pool WITH a special vdev is the
+    // MayaNAS hybrid -- excluded. Only zpools; vg/thinpool are always hot.
+    for (const p of pools) {
+      if (p.kind !== "zpool") { p.tier = "hot"; continue; }
+      try {
+        const zp = await mayacli.showZpool(p.name);
+        const s3 = (zp?.zdisk || []).filter((d) => Number(d.ma) === -1).length;
+        const special = Number(zp?.sdc) > 0;
+        p.tier = s3 > 0 && !special ? "cold" : "hot";
+      } catch (e) {
+        p.tier = "hot"; // classify failure -> treat as hot (offer no cold sink)
+      }
+    }
+    // Pair each hot pool with its node-local cold pool. Replication is
+    // remote=localhost, and a cold pool shares its node's clusterid (verified:
+    // xata-cold-node1 cid == data-pool-1 cid). `coldPool: default` resolves here.
+    const coldByCid = {};
+    for (const p of pools) if (p.tier === "cold") coldByCid[String(p.clusterid)] = p.name;
+    for (const p of pools) if (p.tier === "hot") p.coldPool = coldByCid[String(p.clusterid)] || null;
     const perVip = {};
     for (const p of pools) perVip[p.vip] = (perVip[p.vip] || 0) + 1;
     for (const p of pools) p.default = perVip[p.vip] === 1;
@@ -500,6 +546,7 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
 
     // exact-fit idempotency: pvcname + capacity + active export must match (partial-failure self-heal)
     let deferExport = false;
+    let rehydrated = false; // set by a cross-pool restore (§8 wake) -> skip hook ②
     const exists = await mayacli.volumeExists(vol);
     if (exists) {
       // same name + different capacity = ALREADY_EXISTS conflict
@@ -523,17 +570,49 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
         );
       }
       if (content_source && content_source.snapshot) {
-        // clone from snapshot: snapshot_id IS the configd label -> clone it directly
+        // clone from snapshot: snapshot_id IS the configd label.
         const sid = content_source.snapshot.snapshot_id;
-        const { srcKind } = await mayacli.volSrcInfo(sid);
-        // vg clone target is filled by async dd -> defer export to node-stage
-        if (srcKind === "vg") deferExport = true;
-        await mayacli.createVolumeFromSnapshot({
-          label,
-          snapshotof: sid,
-          vol: srcKind === "vg" ? undefined : vol,
-          sizeG: srcKind === "vg" ? undefined : Math.ceil(capacity_bytes / 1024 ** 3),
-        });
+        // Cold tier (hook ⑤): if the snapshot lives on a DIFFERENT pool than the
+        // target, `copy snapshot` (a zfs clone) cannot cross pools -- this is the
+        // §8 wake. REHYDRATE = reverse replication: create the hot placeholder and
+        // reverse-replicate the cold source into it (origin_first_send does the
+        // placeholder-replace + recv; resumable). Same pool -> the existing clone.
+        const view = await this.buildPoolView();
+        const snapPool = (view.find((p) => sid.startsWith(p.name + "-")) || {}).name;
+        if (snapPool && snapPool !== pool) {
+          const coldVol = sid.slice(0, sid.lastIndexOf("@")); // the cold source volume
+          await mayacli.createVolume({
+            label,
+            container: { kind, name: pool },
+            access: pp.access,
+            sizeBytes: capacity_bytes,
+            recordsize,
+            fs: backendFs,
+            thin,
+            clusterid,
+          });
+          await mayacli.createReplication(coldVol, `localhost:${vol}`);
+          await mayacli.setReplication(coldVol, { interval: "none" });
+          await mayacli.bindReplication(coldVol);
+          if (!(await mayacli.waitReplicationUptodate(coldVol))) {
+            throw new GrpcError(
+              grpc.status.INTERNAL,
+              `rehydrate ${coldVol} -> ${vol} did not reach uptodate`
+            );
+          }
+          await mayacli.deleteReplication(coldVol); // one-shot; don't leave it running
+          rehydrated = true; // don't auto-create a fresh cold twin in hook ②
+        } else {
+          const { srcKind } = await mayacli.volSrcInfo(sid);
+          // vg clone target is filled by async dd -> defer export to node-stage
+          if (srcKind === "vg") deferExport = true;
+          await mayacli.createVolumeFromSnapshot({
+            label,
+            snapshotof: sid,
+            vol: srcKind === "vg" ? undefined : vol,
+            sizeG: srcKind === "vg" ? undefined : Math.ceil(capacity_bytes / 1024 ** 3),
+          });
+        }
       } else if (content_source && content_source.volume) {
         // clone from a volume: snapshot the source first, then clone it
         const srcVol = content_source.volume.volume_id;
@@ -711,6 +790,42 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
       };
     }
 
+    // Cold tier (hook ②): if the StorageClass named a cold sink, set up
+    // replication to it -- POLICY ONLY. interval=none, NO bind: the base send of
+    // an empty zvol is useless, and a fork's base rides origin_first_send; either
+    // way the base sync fires on the FIRST CreateSnapshot (hook ③). Idempotent
+    // (skip if a policy already exists) so partial-failure retries self-heal.
+    const coldParam = _.get(call, "request.parameters.coldPool");
+    if (coldParam && kind === "zpool" && !rehydrated) {
+      const cold = await this.resolveColdPool(pool, coldParam);
+      if (!cold) {
+        throw new GrpcError(
+          grpc.status.INVALID_ARGUMENT,
+          `coldPool '${coldParam}' could not be resolved for pool '${pool}'`
+        );
+      }
+      const coldTwin = `${cold.name}-${label}`;
+      if (!(await mayacli.volumeExists(coldTwin))) {
+        await mayacli.createVolume({
+          label,
+          container: { kind: "zpool", name: cold.name },
+          access: pp.access,
+          sizeBytes: capacity_bytes,
+          recordsize,
+          fs: backendFs,
+          thin,
+          clusterid: cold.clusterid,
+        });
+      }
+      if (!(await mayacli.showReplication(vol))) {
+        await mayacli.createReplication(vol, `localhost:${coldTwin}`);
+        await mayacli.setReplication(vol, {
+          interval: _.get(call, "request.parameters.replicationInterval", "none"),
+          keep: _.get(call, "request.parameters.coldKeep", "4"),
+        });
+      }
+    }
+
     let accessible_topology;
     if (typeof this.getAccessibleTopology === "function") {
       accessible_topology = await this.getAccessibleTopology(call);
@@ -748,6 +863,21 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
     const probe = this.getMayacli();
     const server = await this.ownerServer(probe, vol);
     const mayacli = server ? this.getMayacli([server]) : probe;
+
+    // Cold tier (hook ④): tear down replication BEFORE deleting the zvol -- a
+    // replicated volume is pinned by its policy + auto-repli snapshots and the
+    // delete would EBUSY. `delete replication` cleans BOTH sides for
+    // remote=localhost (perl delete_replication re-issues to the remote). The
+    // cold twin is a SEPARATE volume and is NOT cascaded here -- that is exactly
+    // what lets hibernate keep the cold copy. Then delete the hot volume's own
+    // snapshots (versions + syncpoints) so the zvol releases; they persist on cold.
+    if (await mayacli.showReplication(vol)) {
+      await mayacli.setReplication(vol, { interval: "none" });
+      await mayacli.deleteReplication(vol);
+      for (const sn of await mayacli.showSnapshots(vol)) {
+        if (sn.l) await mayacli.deleteSnapshot(sn.l);
+      }
+    }
 
     // eager: for now queries for origin every delete
     // can be made to query on special error case
@@ -870,6 +1000,24 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
       }
       sin = await mayacli.showSnapshots(source_volume_id);
       s = sin.find((x) => x.l === mayaSnap) || {};
+    }
+    // Cold tier (hook ③): a snapshot on a REPLICATED volume is a VERSION -- sync it
+    // to cold with a single-shot bind (== the sync). The first such snapshot (the
+    // operator's v0 at cluster-ready) rides the base send; later versions ride an
+    // -i. bind forks the sync on the node (async), so we don't block ready_to_use
+    // on cold durability -- the hot snapshot is usable now. A prior sync still
+    // running (EBUSY) means this version rides the next bind; the operator
+    // serialises versions, so that is rare.
+    if (await mayacli.showReplication(source_volume_id)) {
+      try {
+        await mayacli.bindReplication(source_volume_id);
+      } catch (e) {
+        if (!/busy|active|pid/i.test(String(e && e.message))) throw e;
+        this.ctx.logger.verbose(
+          "cold sync busy for %s; version rides next bind",
+          source_volume_id
+        );
+      }
     }
     // (already exists on this source -> idempotent return of the existing snapshot)
     return {
