@@ -1253,9 +1253,27 @@ class CsiBaseDriver {
                 }
               }
 
+              /**
+               * NVMEoF has native multipath capabilities without using device mapper
+               * You can disable the built-in using kernel param nvme_core.multipath=N/Y
+               */
+              let useNativeMultipath = await nvmeof.nativeMultipathEnabled();
+
               // let things settle
               // this will help in dm scenarios
-              await GeneralUtils.sleep(2000);
+              //
+              // only device-mapper needs settling: it is what may asynchronously assemble
+              // an mpath device from the namespace devices attached above, which the dm
+              // branch below inspects. dm cannot be involved when native nvme multipath is
+              // enabled (that branch never consults dm), nor with a single transport --
+              // multipathd's find_multipaths defaults to "strict", which does not claim a
+              // single-path device. NodeStage is on the pod-start hot path, so only pay
+              // this where device-mapper can actually be in play.
+              if (!useNativeMultipath && nvmeofConnections.length > 1) {
+                await GeneralUtils.sleep(
+                  _.get(driver.options, "node.nvmeof.settleMs", 2000)
+                );
+              }
 
               // filter duplicates
               nvmeofNamespaceDevices = nvmeofNamespaceDevices.filter(
@@ -1292,12 +1310,7 @@ class CsiBaseDriver {
                 }
               }
 
-              /**
-               * NVMEoF has native multipath capabilities without using device mapper
-               * You can disable the built-in using kernel param nvme_core.multipath=N/Y
-               */
-              let useNativeMultipath = await nvmeof.nativeMultipathEnabled();
-
+              // useNativeMultipath determined above, before the dm settle
               if (useNativeMultipath) {
                 // only throw an error if we were not able to attach to *any* devices
                 if (nvmeofNamespaceDevices.length > 1) {
