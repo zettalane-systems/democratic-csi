@@ -318,8 +318,8 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
       }
     }
     // Pair each hot pool with its node-local cold pool. Replication is
-    // remote=localhost, and a cold pool shares its node's clusterid (verified:
-    // xata-cold-node1 cid == data-pool-1 cid). `coldPool: default` resolves here.
+    // remote=localhost, and a cold pool is co-located with its hot peer on the
+    // same node -> they share a clusterid. `coldPool: default` resolves here.
     const coldByCid = {};
     for (const p of pools) if (p.tier === "cold") coldByCid[String(p.clusterid)] = p.name;
     for (const p of pools) if (p.tier === "hot") p.coldPool = coldByCid[String(p.clusterid)] || null;
@@ -824,6 +824,27 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
           keep: _.get(call, "request.parameters.coldKeep", "4"),
         });
       }
+    }
+
+    // Cold-tier RE-LINK (hook ②b): an explicit `coldTwin` names an EXISTING cold
+    // volume to forward-replicate to -- NO new twin. Used after a wake/rehydrate,
+    // where hook ② is skipped (rehydrated) and the new pvc uuid can't auto-resolve
+    // the ORIGINAL twin, so the operator passes it by name. INCREMENTAL: the
+    // rehydrated vol shares the received seam with the twin, so the first snapshot
+    // (hook ③) binds an -i, not a full re-send. Idempotent (skip if a policy exists).
+    const relinkTwin = _.get(call, "request.parameters.coldTwin");
+    if (relinkTwin && kind === "zpool" && !(await mayacli.showReplication(vol))) {
+      if (!(await mayacli.volumeExists(relinkTwin))) {
+        throw new GrpcError(
+          grpc.status.FAILED_PRECONDITION,
+          `coldTwin '${relinkTwin}' does not exist for re-link`
+        );
+      }
+      await mayacli.createReplication(vol, `localhost:${relinkTwin}`);
+      await mayacli.setReplication(vol, {
+        interval: _.get(call, "request.parameters.replicationInterval", "none"),
+        keep: _.get(call, "request.parameters.coldKeep", "4"),
+      });
     }
 
     let accessible_topology;
