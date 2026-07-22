@@ -580,7 +580,6 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
         const view = await this.buildPoolView();
         const snapPool = (view.find((p) => sid.startsWith(p.name + "-")) || {}).name;
         if (snapPool && snapPool !== pool) {
-          const coldVol = sid.slice(0, sid.lastIndexOf("@")); // the cold source volume
           await mayacli.createVolume({
             label,
             container: { kind, name: pool },
@@ -591,16 +590,33 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
             thin,
             clusterid,
           });
-          await mayacli.createReplication(coldVol, `localhost:${vol}`);
-          await mayacli.setReplication(coldVol, { interval: "none" });
-          await mayacli.bindReplication(coldVol);
-          if (!(await mayacli.waitReplicationUptodate(coldVol))) {
-            throw new GrpcError(
-              grpc.status.INTERNAL,
-              `rehydrate ${coldVol} -> ${vol} did not reach uptodate`
-            );
+          // Reverse replication is VOLUME-LEVEL -- it sends the source's CURRENT
+          // state, not `sid`. So to honor a PAST snapshot (revert/restore-to-time,
+          // not just the tip that a wake uses) we first CLONE that specific snapshot
+          // on the cold pool (`copy snapshot` pins the point-in-time), then
+          // reverse-replicate the CLONE -> hot. Sending the twin directly would send
+          // its tip (the revert-to-past bug). Clone is a same-pool leaf; its origin
+          // snapshot survives its deletion, and the hot copy is cross-pool independent.
+          const tmpLabel = `rvt-${label}`;
+          const tmpCold = `${snapPool}-${tmpLabel}`;
+          await mayacli.createVolumeFromSnapshot({ label: tmpLabel, snapshotof: sid });
+          try {
+            await mayacli.createReplication(tmpCold, `localhost:${vol}`);
+            await mayacli.setReplication(tmpCold, { interval: "none" });
+            await mayacli.bindReplication(tmpCold);
+            if (!(await mayacli.waitReplicationUptodate(tmpCold))) {
+              throw new GrpcError(
+                grpc.status.INTERNAL,
+                `rehydrate ${sid} -> ${vol} did not reach uptodate`
+              );
+            }
+            await mayacli.deleteReplication(tmpCold); // one-shot; don't leave it running
+          } finally {
+            // `bind replication` cut an @auto-repli syncpoint ON the clone; drop the
+            // clone's snapshots first, else delete volume hits EBUSY (temp-clone leak).
+            await mayacli.deleteSnapshot(tmpCold).catch(() => {});
+            await mayacli.deleteVolume(tmpCold); // drop the temp clone (origin snap stays)
           }
-          await mayacli.deleteReplication(coldVol); // one-shot; don't leave it running
           rehydrated = true; // don't auto-create a fresh cold twin in hook ②
         } else {
           const { srcKind } = await mayacli.volSrcInfo(sid);
