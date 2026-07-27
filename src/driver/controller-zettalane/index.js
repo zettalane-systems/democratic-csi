@@ -209,7 +209,13 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
     // arbitrary (first) VIP -- that silently runs the backend op on a node that lacks the pool and
     // either errors ("No such file or directory") or, worse, mutates the wrong place. Fail loudly.
     const { byMapid } = await probe.showFailover();
-    const server = v.cid != null ? byMapid[String(v.cid)] : null;
+    const eps = this.endpoints();
+    // single-node (one endpoint) has no failover map, so byMapid[cid] is empty -- route the
+    // mutation to the sole node: with one node there is no "arbitrary node" risk. Mirrors the
+    // single-endpoint fallback in _discoverPools. Multi-node still fails loudly below.
+    const server =
+      (v.cid != null ? byMapid[String(v.cid)] : null) ||
+      (eps.length === 1 ? eps[0] : null);
     if (!server) {
       this.ctx.logger.warn(`ownerServer: '${id}' cid=${v.cid} has no VIP in byMapid=${JSON.stringify(byMapid)}`);
       throw new GrpcError(
