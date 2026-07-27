@@ -509,6 +509,8 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
     const { clusterid, server, kind } = await this.resolvePool(pool);
     const mayacli = this.getMayacli([server]);
     const recordsize = _.get(call, "request.parameters.recordsize", "128K");
+    const volblocksize = _.get(call, "request.parameters.volblocksize");
+    const compression = _.get(call, "request.parameters.compression");
     // backend filesystem for LVM file pools (vg/thinpool NFS/SMB): xfs (default) | ext4.
     // ignored for zpool (always zfs) and for block volumes.
     const backendFs = String(
@@ -586,6 +588,8 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
             access: pp.access,
             sizeBytes: capacity_bytes,
             recordsize,
+            volblocksize,
+            compression,
             fs: backendFs,
             thin,
             clusterid,
@@ -653,6 +657,8 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
           access: pp.access,
           sizeBytes: capacity_bytes,
           recordsize,
+          volblocksize,
+          compression,
           fs: backendFs,
           thin,
           clusterid,
@@ -828,6 +834,8 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
           access: pp.access,
           sizeBytes: capacity_bytes,
           recordsize,
+          volblocksize,
+          compression,
           fs: backendFs,
           thin,
           clusterid: cold.clusterid,

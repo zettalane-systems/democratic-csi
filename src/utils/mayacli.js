@@ -140,7 +140,8 @@ class Mayacli {
    * Provision a volume: result type follows access (filesystem -> V_FILESYS,
    * block -> V_FLEX), container keyword follows kind. Thick unless a.thin.
    * @param {object} a {label, container:{kind,name}, access, sizeBytes,
-   *                     recordsize?, fs?(xfs|ext4, LVM filesys), thin?, thinpool?, clusterid?}
+   *                     recordsize?, volblocksize?(zvol), compression?(zvol),
+   *                     fs?(xfs|ext4, LVM filesys), thin?, thinpool?, clusterid?}
    */
   async createVolume(a) {
     const { kind, name } = a.container;
@@ -167,9 +168,14 @@ class Mayacli {
       // block (V_FLEX): zvol on a zpool, or LV on a VG
       args.push(a.thin && a.thinpool ? `thinpool=${a.thinpool}` : container);
       if (a.sizeBytes) args.push(`size=${a.sizeBytes}`);
-      // add zpool zvol sparse option if thin requested
-      if (kind === "zpool" && a.thin) args.push(Mayacli.opt('"-s"'));
       if (a.clusterid != null) args.push(`clusterid=${a.clusterid}`);
+      if (kind === "zpool") {
+        if (a.volblocksize) args.push(`blocksize=${a.volblocksize}`);
+        const zopts = [];
+        if (a.compression) zopts.push(`-o compression=${a.compression}`);
+        if (a.thin) zopts.push("-s"); // sparse
+        if (zopts.length) args.push(Mayacli.opt(`"${zopts.join(" ")}"`));
+      }
     }
     // idempotency is the caller's job (check-first); a stray EEXIST is a real race -> surface it
     return this.execOk(args, { force: true });
