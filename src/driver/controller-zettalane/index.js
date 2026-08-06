@@ -614,10 +614,14 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
             await mayacli.createReplication(tmpCold, `localhost:${vol}`);
             await mayacli.setReplication(tmpCold, { interval: "none" });
             await mayacli.bindReplication(tmpCold);
-            if (!(await mayacli.waitReplicationUptodate(tmpCold))) {
+            // NB waitReplicationUptodate returns an OBJECT -- test .ok, never the
+            // value itself (an object is always truthy).
+            const up = await mayacli.waitReplicationUptodate(tmpCold);
+            if (!up.ok) {
               throw new GrpcError(
                 grpc.status.INTERNAL,
-                `rehydrate ${sid} -> ${vol} did not reach uptodate`
+                `rehydrate ${sid} -> ${vol} did not reach uptodate ` +
+                  `(status=${up.st} progress=${up.pct}% pid=${up.pid})`
               );
             }
             await mayacli.deleteReplication(tmpCold); // one-shot; don't leave it running

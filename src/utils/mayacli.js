@@ -16,6 +16,12 @@ const ERRNO = { EPERM: 1, ENOENT: 2, EBUSY: 16, EEXIST: 17, EINVAL: 22,
   EOPNOTSUPP: 95
 };
 
+// Replication status: the `st:` field in a -j replivolinfo record. Mirrors the
+// ladder configd renders (cmds/cli/replication.c) and the REPLI_STAT_* enum.
+const REPLI_ST = {
+  INIT: 0, SYNC: 1, UPTODATE: 2, RESUMING: 3, ERROR: 4,
+};
+
 // Volume types: the `t:` field in -j records
 const VOL_TYPE = {
   UNKNOWN: 0, PROXY: 1, BLOCK: 2, FLEX: 3, SNAP: 4, FILE: 5, FILESYS: 6,
@@ -241,23 +247,48 @@ class Mayacli {
   async bindReplication(vol) { return this.execOk(["bind", "replication", vol]); }
   /** delete replication <vol> -- caller gates on showReplication, so a policy exists. */
   async deleteReplication(vol) { return this.execOk(["delete", "replication", vol]); }
-  /** True if <vol> has an active replication policy (the "is replicated?" gate).
-   *  remote=localhost has NO separate secondary policy, so the cold twin returns
-   *  false -- always probe the HOT volume. */
-  async showReplication(vol) {
-    const r = await this.exec(["-s", "show", "replication", vol]);
-    const out = r.stdout || "";
-    if (/no replication info|not enabled/i.test(out)) return false;
-    return out.includes("->"); // the policy render line ("<vol> -> localhost:<cold> ...")
+  /** <vol>'s replication record via `-j show replication <vol>`, or null.
+   *  Fields that matter: `dst` 0 = this vol is the SOURCE, 1 = it IS the destination;
+   *  `res` "<host>:<peer>" (on a destination the peer is its current SOURCE);
+   *  `ro` 1 = primary, 2 = secondary (REPLI_ROLE_* in configd replication.c). */
+  async replicationInfo(vol) {
+    const r = await this.exec(["-j", "show", "replication", vol]);
+    return (this.parseJ(r.stdout).replivolinfo || [])[0] || null;
   }
-  /** Wait until `show replication` reports uptodate (after a bind). */
+  /** True if <vol> has an OUTBOUND replication policy (the "is replicated?" gate). */
+  async showReplication(vol) {
+    const i = await this.replicationInfo(vol);
+    return !!i && Number(i.dst) === 0;
+  }
+  /** Wait until <vol>'s replication reaches uptodate, after a bind.
+   *
+   *  Reads the STRUCTURED record, not the human render: `st` is the status ladder
+   *  (cli/replication.c: 0 initial, 1 replicating, 2 uptodate, 3 resuming, 4 error),
+   *  `pct` the progress, `pid` the running send. Matching the rendered text instead
+   *  would tie the wait to a display format -- and it would fail OPEN in the worst way,
+   *  since a reworded column reads as "never reached uptodate" and the caller then
+   *  tears down NVMe on its timeout.
+   *
+   *  Returns {ok, st, pct, pid, err} rather than a bare boolean so the caller can tell
+   *  "still syncing" from "no send is even running" and can report how far it got.
+   *  NB it is an OBJECT -- test `.ok`, never truthiness. */
   async waitReplicationUptodate(vol, { tries = 40, delayMs = 3000 } = {}) {
-    for (let i = 0; i < tries; i++) {
-      const r = await this.exec(["-s", "show", "replication", vol]);
-      if (/uptodate/.test(r.stdout || "")) return true;
+    const snap = (i) => ({
+      st: i ? Number(i.st) : null,
+      pct: i ? Number(i.pct) : null,
+      pid: i ? Number(i.pid) : null,
+      err: i ? Number(i.err) : null,
+    });
+    let last = snap(null);
+    for (let n = 0; n < tries; n++) {
+      const info = await this.replicationInfo(vol).catch(() => null);
+      last = snap(info);
+      if (last.st === REPLI_ST.UPTODATE) return { ok: true, ...last };
+      // error is terminal -- spinning out the full timeout just delays the report.
+      if (last.st === REPLI_ST.ERROR) return { ok: false, ...last };
       await new Promise((res) => setTimeout(res, delayMs));
     }
-    return false;
+    return { ok: false, ...last };
   }
 
   // ---- discovery: derive pools->{clusterid,vip} from the cluster ----
@@ -699,3 +730,4 @@ class Mayacli {
 module.exports.Mayacli = Mayacli;
 module.exports.VOL_TYPE = VOL_TYPE;
 module.exports.ERRNO = ERRNO;
+module.exports.REPLI_ST = REPLI_ST;
