@@ -924,14 +924,11 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
     // delete would EBUSY. `delete replication` cleans BOTH sides for
     // remote=localhost (perl delete_replication re-issues to the remote). The
     // cold twin is a SEPARATE volume and is NOT cascaded here -- that is exactly
-    // what lets hibernate keep the cold copy. Then delete the hot volume's own
-    // snapshots (versions + syncpoints) so the zvol releases; they persist on cold.
+    // what lets hibernate keep the cold copy. The volume's own snapshots are
+    // purged further down, right before the destroy -- see the note there.
     if (await mayacli.showReplication(vol)) {
       await mayacli.setReplication(vol, { interval: "none" });
       await mayacli.deleteReplication(vol);
-      for (const sn of await mayacli.showSnapshots(vol)) {
-        if (sn.l) await mayacli.deleteSnapshot(sn.l);
-      }
     }
 
     // eager: for now queries for origin every delete
@@ -970,6 +967,17 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
           if (portalTag != null) await cli.deletePortal(portalTag);
         }
       }
+    }
+
+    // Purge the volume's own snapshots (versions + syncpoints) LAST and on EVERY
+    // attempt, so the zvol releases. This deliberately sits outside the replication
+    // block: the auto-repli timer can cut a fresh syncpoint after that block runs,
+    // and by the retry `show replication` is already empty -- so a purge nested
+    // there is skipped, `delete volume` EBUSYs (rc=16) against the leftover
+    // snapshot, and it does so forever. The PV stays Released and the zvol plus its
+    // snapshot leak silently. Purging here is what lets the retry converge.
+    for (const sn of await mayacli.showSnapshots(vol)) {
+      if (sn.l) await mayacli.deleteSnapshot(sn.l);
     }
 
     await mayacli.deleteVolume(vol);
