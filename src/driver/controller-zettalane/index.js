@@ -528,6 +528,29 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
         `parameters.filesystem '${backendFs}' unsupported (xfs|ext4)`
       );
     }
+    // Cold sync cadence. Validated HERE, before any volume is created -- throwing
+    // after the creates orphans a hot volume AND a twin that nothing reclaims
+    // (CreateVolume never returns, so there is no PV to cascade a delete from).
+    // Block drives its own sends off version cuts (hook 3), so `none` is right
+    // there. A NAS share has no version cuts -- with `none` the twin syncs ONCE at
+    // create and never again, silently -- so filesystem volumes get a real
+    // schedule. hourly bounds the loss on an ABRUPT node loss; drain takes a final
+    // sync, so a planned stop is unaffected.
+    // interval+period default as a PAIR -- naming only the interval must not
+    // inherit the other unit's period (`hourly` + 15 => every 15 HOURS).
+    const REPLI_INTERVALS = ["none", "frequent", "hourly", "daily", "monthly"];
+    const namedInterval = _.get(call, "request.parameters.replicationInterval");
+    const wantFs = this.getDriverZfsResourceType() === "filesystem";
+    const repliInterval = namedInterval || (wantFs ? "hourly" : "none");
+    if (!REPLI_INTERVALS.includes(repliInterval)) {
+      throw new GrpcError(
+        grpc.status.INVALID_ARGUMENT,
+        `replicationInterval '${repliInterval}' invalid (${REPLI_INTERVALS.join("|")})`
+      );
+    }
+    const repliPeriod =
+      _.get(call, "request.parameters.replicationPeriod") ||
+      (namedInterval || !wantFs ? undefined : "1");
     // thick by default; thin is opt-in (zfs drops refreservation, LVM uses a thin pool)
     const thinRaw = _.get(call, "request.parameters.thin"); // undefined if not specified
     const thin = String(thinRaw ?? "").toLowerCase() === "true";
@@ -854,7 +877,8 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
       if (!(await mayacli.showReplication(vol))) {
         await mayacli.createReplication(vol, `localhost:${coldTwin}`);
         await mayacli.setReplication(vol, {
-          interval: _.get(call, "request.parameters.replicationInterval", "none"),
+          interval: repliInterval,
+          period: repliPeriod,
           keep: _.get(call, "request.parameters.coldKeep", "4"),
         });
       }
