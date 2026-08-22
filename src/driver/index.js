@@ -272,6 +272,16 @@ class CsiBaseDriver {
     return res.body;
   }
 
+  /** VolumeSnapshot is a CRD, so it needs CustomObjectsApi rather than CoreV1. */
+  async getVolumeSnapshot(name, namespace) {
+    const kc = this.getDefaultKubernetsConfigInstance();
+    const api = kc.makeApiClient(k8s.CustomObjectsApi);
+    const res = await api.getNamespacedCustomObject(
+      "snapshot.storage.k8s.io", "v1", namespace, "volumesnapshots", name
+    );
+    return res.body;
+  }
+
   getCsiProxyEnabled() {
     const defaultValue = process.platform == "win32";
     return _.get(this.options, "node.csiProxy.enabled", defaultValue);

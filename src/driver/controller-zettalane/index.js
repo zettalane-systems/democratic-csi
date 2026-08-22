@@ -551,6 +551,40 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
     const repliPeriod =
       _.get(call, "request.parameters.replicationPeriod") ||
       (namedInterval || !wantFs ? undefined : "1");
+
+    // zl:* identity for the SELF-DESCRIBING cold tier. Stamped on the HOT dataset only;
+    // `zfs send -p` carries it to the twin as source=received. Deliberately NOT stamped
+    // on the twin -- a local prop outranks a received one under zfs precedence, so the
+    // twin would shadow the source and silently go stale on a rename/re-point.
+    // ⚠️ Must be at CREATE: properties do NOT retroactively update a receiver, so a
+    // later `zfs set` never reaches the cold copy.
+    // Gated on coldPool so hot-only volumes pay no extra API call, and on zpool because
+    // an LVM volume cannot carry zfs user properties at all.
+    // SOFT failure: absent annotations or a lookup error provisions UNSTAMPED. Losing a
+    // label degrades the cold tier; failing CreateVolume is an outage.
+    let zlProps;
+    if (_.get(call, "request.parameters.coldPool") && kind === "zpool") {
+      const pvcName = _.get(call, "request.parameters['csi.storage.k8s.io/pvc/name']");
+      const pvcNs = _.get(call, "request.parameters['csi.storage.k8s.io/pvc/namespace']");
+      if (pvcName && pvcNs) {
+        try {
+          const pvc = await this.getPersistentVolumeClaim(pvcName, pvcNs);
+          const ann = _.get(pvc, "metadata.annotations", {}) || {};
+          const proj = ann["zl.zettalane.com/project"];
+          const branch = ann["zl.zettalane.com/branch"];
+          if (proj || branch) {
+            zlProps = {};
+            if (proj) zlProps["zl:project"] = proj;
+            if (branch) zlProps["zl:branch"] = branch;
+          }
+        } catch (e) {
+          this.ctx.logger.warn(
+            "zl stamping: PVC %s/%s unreadable (%s); provisioning unstamped",
+            pvcNs, pvcName, e && e.message
+          );
+        }
+      }
+    }
     // thick by default; thin is opt-in (zfs drops refreservation, LVM uses a thin pool)
     const thinRaw = _.get(call, "request.parameters.thin"); // undefined if not specified
     const thin = String(thinRaw ?? "").toLowerCase() === "true";
@@ -695,6 +729,7 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
           fs: backendFs,
           thin,
           clusterid,
+          zlProps,
         });
       }
     }
@@ -1070,6 +1105,29 @@ class ControllerZettalaneDriver extends CsiBaseDriver {
         name: srcKind === "vg" || srcKind === "thinpool" ? mayaSnap : name,
         vol: source_volume_id,
       };
+      // zl:version for the self-describing cold tier. Only meaningful on a REPLICATED
+      // zpool volume -- a version snapshot is what a DR tree query names -- so gate on
+      // that and leave hot-only / LVM snapshots paying no extra API call.
+      // The label rides as a VolumeSnapshot ANNOTATION rather than being parsed out of
+      // the name (`<cluster>-<label>`, RFC-1123 sanitized). SOFT failure throughout: an
+      // unstamped snapshot degrades the cold tier, a thrown CreateSnapshot breaks
+      // versioning entirely.
+      if (srcKind === "zpool") {
+        const vsName = _.get(call, "request.parameters['csi.storage.k8s.io/volumesnapshot/name']");
+        const vsNs = _.get(call, "request.parameters['csi.storage.k8s.io/volumesnapshot/namespace']");
+        if (vsName && vsNs && (await mayacli.showReplication(source_volume_id))) {
+          try {
+            const vs = await this.getVolumeSnapshot(vsName, vsNs);
+            const ver = _.get(vs, "metadata.annotations", {})["zl.zettalane.com/version"];
+            if (ver) opts.zlProps = { "zl:version": ver };
+          } catch (e) {
+            this.ctx.logger.warn(
+              "zl stamping: VolumeSnapshot %s/%s unreadable (%s); snapshot unstamped",
+              vsNs, vsName, e && e.message
+            );
+          }
+        }
+      }
       if (srcKind === "vg") {
         // a thick LVM snapshot needs a CoW area; default 25% of the source size
         const cowMiB = Math.max(1, Math.ceil((sizeBytes * 25) / 100 / (1024 * 1024)));

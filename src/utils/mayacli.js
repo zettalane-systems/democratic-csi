@@ -141,6 +141,12 @@ class Mayacli {
     return `options=${s}`;
   }
 
+  /** zl:* user props as `-o` flags. configd forwards these straight to `zfs create`,
+   *  and `zfs send -p` then carries them to the twin (source=received). */
+  static zlOpts(zlProps) {
+    return Object.entries(zlProps || {}).map(([k, v]) => `-o ${k}=${v}`);
+  }
+
   // ---- volume ----------------------------------------------------------------
   /**
    * Provision a volume: result type follows access (filesystem -> V_FILESYS,
@@ -157,7 +163,7 @@ class Mayacli {
 
     if (a.access === "filesystem") {
       if (kind === "zpool") {
-        const opts = [];
+        const opts = Mayacli.zlOpts(a.zlProps);
         if (a.recordsize) opts.push(`-o recordsize=${a.recordsize}`);
         if (a.sizeBytes) opts.push(`-o refquota=${a.sizeBytes}`); // cap
         if (a.sizeBytes && !a.thin) opts.push(`-o refreservation=${a.sizeBytes}`); // thick
@@ -177,7 +183,7 @@ class Mayacli {
       if (a.clusterid != null) args.push(`clusterid=${a.clusterid}`);
       if (kind === "zpool") {
         if (a.volblocksize) args.push(`blocksize=${a.volblocksize}`);
-        const zopts = [];
+        const zopts = Mayacli.zlOpts(a.zlProps);
         if (a.compression) zopts.push(`-o compression=${a.compression}`);
         if (a.thin) zopts.push("-s"); // sparse
         if (zopts.length) args.push(Mayacli.opt(`"${zopts.join(" ")}"`));
@@ -711,6 +717,10 @@ class Mayacli {
     const args = ["create", "snapshot", a.name, `snapshotof=${a.vol}`];
     if (a.size) args.push(`size=${a.size}`);
     else if (a.sizeG) args.push(`size=${a.sizeG}G`);
+    // zl:* must be stamped AT CREATE -- a later `zfs set` never reaches a receiver, so
+    // a version snapshot stamped after its send would be nameless on the cold copy.
+    const zl = Mayacli.zlOpts(a.zlProps);
+    if (zl.length) args.push(Mayacli.opt(`"${zl.join(" ")}"`));
     return this.execOk(args);
   }
 
